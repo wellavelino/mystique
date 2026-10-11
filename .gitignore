@@ -1,0 +1,6 @@
+# Written by Claude Code beside a mod it loads: the API's types, and the tools
+# connected on the machine that loaded it. Machine-specific, never committed.
+.claude-plugin/types/
+
+node_modules/
+.DS_Store
