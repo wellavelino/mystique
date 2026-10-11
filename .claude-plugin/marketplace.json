@@ -1,0 +1,14 @@
+{
+  "name": "mystique",
+  "description": "The mystique mod for Claude Code.",
+  "owner": {
+    "name": "wellavelino"
+  },
+  "plugins": [
+    {
+      "name": "mystique",
+      "source": "./",
+      "description": "A highlighter pen for Claude's replies, and a side panel for query results as tables and for the goal, the tasks and every subagent."
+    }
+  ]
+}

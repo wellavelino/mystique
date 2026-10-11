@@ -1,0 +1,349 @@
+import type { AgentRow, Board, Task } from '../../types'
+
+export const EMPTY: Board = {
+  goal: null,
+  ask: '',
+  tasks: [],
+  agents: [],
+  context: 0,
+  window: 0,
+  used: 0,
+  total: 0,
+  limits: [],
+}
+
+const MAX_AGENTS = 24
+const MAX_TASKS = 200
+const MAX_LABEL = 120
+
+/** What one model request reports of its cost, as the API counts it. */
+export type Usage = {
+  input_tokens: number
+  output_tokens: number
+  cache_read_input_tokens: number
+  cache_creation_input_tokens: number
+}
+
+/** The tokens a context holds after the request `usage` reports: all it read, and what it wrote. */
+export function filled(usage: Usage): number {
+  return (
+    usage.input_tokens +
+    usage.cache_read_input_tokens +
+    usage.cache_creation_input_tokens +
+    usage.output_tokens
+  )
+}
+
+/**
+ * What a request spent, in input-token equivalents: output counts five times an input token,
+ * a cache write one and a quarter, a cache read a tenth, as the API's prices relate them.
+ */
+export function spent(usage: Usage): number {
+  return (
+    usage.input_tokens +
+    5 * usage.output_tokens +
+    1.25 * usage.cache_creation_input_tokens +
+    0.1 * usage.cache_read_input_tokens
+  )
+}
+
+const headline = (text: string) => {
+  const line = text.trim().split('\n')[0]?.trim() ?? ''
+
+  return line.length > MAX_LABEL ? `${line.slice(0, MAX_LABEL - 1)}…` : line
+}
+
+// A slash command is one word after the slash: a path (/etc/hosts) has a second slash in it.
+const COMMAND = /^\/[a-z][\w:-]*(\s|$)/i
+const DELIVERY =
+  /^<(agent-message|task-notification|system-reminder|teammate-message|cross-session-message|local-command-[\w-]+|command-[\w-]+)[\s>]/
+
+/**
+ * Whether a turn's opening text is the person asking for something. A turn the engine starts for
+ * a slash command or a delivery (an agent's message, a task's notification) is not.
+ */
+export function isAsk(text: string): boolean {
+  const opening = text.trimStart()
+
+  return opening !== '' && !COMMAND.test(opening) && !DELIVERY.test(opening)
+}
+
+/** A new prompt: it names the work until a goal does, and clears what the last turn finished. */
+export function asked(board: Board, text: string): Board {
+  if (!isAsk(text)) {
+    return board
+  }
+
+  const isDone = board.tasks.length > 0 && board.tasks.every(task => task.status === 'completed')
+
+  return {
+    ...board,
+    ask: headline(text),
+    tasks: isDone ? [] : board.tasks,
+    agents: board.agents.filter(agent => agent.status === 'running'),
+  }
+}
+
+/** The goal as /goal was given it: its words, or none when it was cleared. */
+export function aimed(board: Board, args: string): Board {
+  const text = args.trim()
+
+  if (text === '') {
+    return board
+  }
+
+  return { ...board, goal: /^(clear|off|none|stop|cancel|reset|done)$/i.test(text) ? null : headline(text) }
+}
+
+const record = (value: unknown): Record<string, unknown> =>
+  typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {}
+const text = (value: unknown) => (typeof value === 'string' ? value : '')
+const status = (value: unknown): Task['status'] =>
+  value === 'in_progress' || value === 'completed' ? value : 'pending'
+
+/** `tasks` after one call of a task tool (TodoWrite, TaskCreate, TaskUpdate); any other tool leaves them. */
+export function tasked(tasks: readonly Task[], tool: string, input: unknown, result: unknown): Task[] {
+  const given = record(input)
+
+  if (tool === 'TodoWrite' && Array.isArray(given.todos)) {
+    return given.todos.slice(0, MAX_TASKS).map((todo, index) => {
+      const one = record(todo)
+
+      return {
+        id: String(index),
+        subject: text(one.content),
+        status: status(one.status),
+        active: text(one.activeForm) || undefined,
+      }
+    })
+  }
+
+  if (tool === 'TaskCreate') {
+    const id = text(record(record(result).task).id)
+
+    return id === '' || tasks.some(task => task.id === id)
+      ? [...tasks]
+      : [
+          ...tasks,
+          { id, subject: text(given.subject), status: 'pending' as const, active: text(given.activeForm) || undefined },
+        ].slice(-MAX_TASKS)
+  }
+
+  if (tool === 'TaskUpdate') {
+    const id = text(given.taskId)
+
+    if (id === '' || record(result).success === false) {
+      return [...tasks]
+    }
+
+    if (given.status === 'deleted') {
+      return tasks.filter(task => task.id !== id)
+    }
+
+    // A task made before the mod loaded is first heard of here.
+    const known = tasks.find(task => task.id === id) ?? { id, subject: `task ${id}`, status: 'pending' as const }
+    const changed: Task = {
+      ...known,
+      subject: text(given.subject) || known.subject,
+      status: given.status === undefined ? known.status : status(given.status),
+      active: text(given.activeForm) || known.active,
+    }
+
+    return tasks.some(task => task.id === id)
+      ? tasks.map(task => (task.id === id ? changed : task))
+      : [...tasks, changed].slice(-MAX_TASKS)
+  }
+
+  return [...tasks]
+}
+
+const fresh = (id: string, now: number): AgentRow => ({
+  id,
+  label: '',
+  type: '',
+  status: 'running',
+  tools: 0,
+  last: '',
+  context: 0,
+  used: 0,
+  tasks: [],
+  startedAt: now,
+})
+
+/** `board` with one subagent's row changed, the row made (at `now`) when the agent is first heard of. */
+export function withAgent(
+  board: Board,
+  id: string,
+  now: number,
+  change: (agent: AgentRow) => AgentRow,
+): Board {
+  const isKnown = board.agents.some(agent => agent.id === id)
+  const agents = (isKnown ? board.agents : [...board.agents, fresh(id, now)]).map(agent =>
+    agent.id === id ? change(agent) : agent,
+  )
+
+  // A full board lets its oldest finished agent go before any that still runs.
+  while (agents.length > MAX_AGENTS) {
+    const finished = agents.findIndex(agent => agent.status !== 'running' && agent.id !== id)
+
+    agents.splice(finished === -1 ? 0 : finished, 1)
+  }
+
+  return { ...board, agents }
+}
+
+/** An agent on the board given its name and type; one that left the board stays gone. */
+export function named(board: Board, id: string, label: string, type: string): Board {
+  return board.agents.some(agent => agent.id === id)
+    ? withAgent(board, id, 0, agent => ({ ...agent, label, type }))
+    : board
+}
+
+/** The rows still running that the engine no longer runs (`live` holds the ids it does), ended. */
+export function reconciled(board: Board, live: readonly string[], now: number): Board {
+  const isGone = (agent: AgentRow) => agent.status === 'running' && !live.includes(agent.id)
+
+  return board.agents.some(isGone)
+    ? {
+        ...board,
+        agents: board.agents.map(agent =>
+          isGone(agent) ? { ...agent, status: 'done' as const, endedAt: now } : agent,
+        ),
+      }
+    : board
+}
+
+/** The board without its tasks and its agents: the goal and the figures stay. */
+export function cleared(board: Board): Board {
+  return { ...board, tasks: [], agents: [] }
+}
+
+/** All the session spent: its count, or for a board kept before it was counted, what the rows hold. */
+function all(board: Board): number {
+  return Math.max(board.total ?? 0, board.agents.reduce((sum, agent) => sum + agent.used, board.used))
+}
+
+/** A model request answered: the context it filled and what it spent, on the main thread or an agent. */
+export function stepped(board: Board, agentId: string | undefined, usage: Usage, now: number): Board {
+  const total = all(board) + spent(usage)
+
+  if (agentId === undefined) {
+    return { ...board, context: filled(usage), used: board.used + spent(usage), total }
+  }
+
+  return withAgent({ ...board, total }, agentId, now, agent => ({
+    ...agent,
+    status: 'running',
+    endedAt: undefined,
+    context: filled(usage),
+    used: agent.used + spent(usage),
+  }))
+}
+
+/** An agent's run over: how it ended and when. One never heard of leaves the board as it was. */
+export function ended(board: Board, agentId: string, status: 'done' | 'failed', now: number): Board {
+  return board.agents.some(agent => agent.id === agentId)
+    ? withAgent(board, agentId, now, agent => ({ ...agent, status, endedAt: now }))
+    : board
+}
+
+/** A tool call an agent or the main thread made: its tasks when it is a task tool, an agent's count. */
+export function tooled(
+  board: Board,
+  agentId: string | undefined,
+  tool: string,
+  input: unknown,
+  result: unknown,
+  now: number,
+): Board {
+  if (agentId === undefined) {
+    return { ...board, tasks: tasked(board.tasks, tool, input, result) }
+  }
+
+  // The task tools keep one list for the session: an agent that updates a main task changes that.
+  const id = tool === 'TaskUpdate' ? text(record(input).taskId) : ''
+  const row = board.agents.find(agent => agent.id === agentId)
+  const isMain =
+    id !== '' && board.tasks.some(task => task.id === id) && row?.tasks.some(task => task.id === id) !== true
+  const booked = isMain ? { ...board, tasks: tasked(board.tasks, tool, input, result) } : board
+
+  return withAgent(booked, agentId, now, agent => ({
+    ...agent,
+    tools: agent.tools + 1,
+    last: tool.replace(/^mcp__/, '').replace(/__/g, ' '),
+    tasks: isMain ? agent.tasks : tasked(agent.tasks, tool, input, result),
+  }))
+}
+
+export type Progress = { done: number; total: number; current: string }
+
+/** How far a task list is: how many are done, and what is being done now. */
+export function progress(tasks: readonly Task[]): Progress {
+  const current = tasks.find(task => task.status === 'in_progress')
+
+  return {
+    done: tasks.filter(task => task.status === 'completed').length,
+    total: tasks.length,
+    current: current === undefined ? '' : current.active || current.subject,
+  }
+}
+
+/** The percent of all the session spent that `used` is. */
+export function share(board: Board, used: number): number {
+  const whole = all(board)
+
+  return whole <= 0 ? 0 : Math.round((used / whole) * 100)
+}
+
+/** A bar of `width` cells for a fraction: the filled part and the rest. */
+export function bar(fraction: number, width: number): { full: string; rest: string } {
+  const held = Number.isFinite(fraction) ? Math.min(1, Math.max(0, fraction)) : 0
+  // Any progress shows at least one cell, and only all of it fills the bar.
+  const cells = held === 0 ? 0 : held === 1 ? width : Math.min(width - 1, Math.max(1, Math.round(held * width)))
+
+  return { full: '█'.repeat(cells), rest: '░'.repeat(width - cells) }
+}
+
+/** A token count as a status line writes it: 950, 48k, 1.2M. */
+export function compact(tokens: number): string {
+  if (tokens >= 999_500) {
+    return `${(tokens / 1_000_000).toFixed(1)}M`
+  }
+
+  return tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : String(Math.round(tokens))
+}
+
+/** A stretch of time as a status line writes it: 48s, 1m 12s, 1h 03m. */
+export function elapsed(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000))
+
+  if (seconds < 60) {
+    return `${seconds}s`
+  }
+
+  const minutes = Math.floor(seconds / 60)
+
+  return minutes < 60
+    ? `${minutes}m ${String(seconds % 60).padStart(2, '0')}s`
+    : `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`
+}
+
+/**
+ * The stretch of a task list worth drawing in `room` rows: it opens just before the first task
+ * not yet done, so what was just finished, what runs and what comes next all show.
+ */
+export function nearby(tasks: readonly Task[], room: number): { before: number; shown: Task[]; after: number } {
+  if (tasks.length <= room) {
+    return { before: 0, shown: [...tasks], after: 0 }
+  }
+
+  const open = tasks.findIndex(task => task.status !== 'completed')
+  const from = Math.min(Math.max(0, (open === -1 ? tasks.length : open) - 1), tasks.length - room)
+
+  return { before: from, shown: tasks.slice(from, from + room), after: tasks.length - from - room }
+}
+
+/** Whether the band has anything to say. */
+export function hasWork(board: Board): boolean {
+  return board.goal !== null || board.tasks.length > 0 || board.agents.length > 0
+}
