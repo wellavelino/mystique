@@ -8,29 +8,6 @@ A mod for [Claude Code](https://claude.com/claude-code) that changes how you rea
   - **Agents:** the goal, the task list, and a card for the main thread and every subagent: what it is doing, how full its context is, and how much of the session's use is its own.
 - **A progress band** above the prompt with the same figures in one line per thread.
 
-```
-● The deploy finished. ▐2 of 14 smoke tests failed▌, and the      │ [ Tables 1 ] [ Agents 2 ]  ● 1 running
-  other 12 passed. You must ▐rotate the API key before Friday▌.   │ ──────────────────────────────────────────────
-                                                                  │ ╭────────────────────────────────────────────╮
-● mystique: Second reader: the migration command exited with      │ │ ◆ Goal                                     │
-  code 3, which the reply does not mention.                       │ │ all smoke tests pass on staging            │
-                                                                  │ │ tasks    ████████░░░░░░░░ 2/4              │
-                                                                  │ │ ✔ Apply migration                          │
-                                                                  │ │ ▸ Running smoke tests                      │
-                                                                  │ │ ○ Rotate key                               │
-                                                                  │ ╰────────────────────────────────────────────╯
-                                                                  │ ╭────────────────────────────────────────────╮
-                                                                  │ │ ● Check billing module        running 48s  │
-                                                                  │ │ general-purpose · 9 tools · now: Grep      │
-                                                                  │ │ context  ███░░░░░░░░░░░░░ 18%  36k         │
-                                                                  │ │ use      █████░░░░░░░░░░░ 31% of session   │
-                                                                  │ ╰────────────────────────────────────────────╯
-◆ Goal: all smoke tests pass on staging   ████░░░░ 2/4   ctx ██░░░ 41%
-  ↳ Check billing module   running · 9 tools · Grep       ctx █░░░░ 18%
-```
-
-(`▐…▌` stands for the pen: dark text on a yellow background in the terminal.)
-
 ## Install
 
 In a Claude Code terminal session, type:
@@ -45,7 +22,9 @@ Requires a Claude Code build with function-hook mods (written against 2.1.296). 
 
 ## The highlighter
 
-Nothing to do. When a turn ends, a second reader looks at the reply and:
+Models spit a lot of text and in most cases due to lack of attention we miss important details, it highlights things that are important in the context you working
+
+ When a turn ends, a second reader looks at the reply and:
 
 - names up to four phrases you must not miss (the result, a decision made for you, a number that matters, a warning, something you now have to do), which are drawn as pen marks in that reply, and in no other;
 - adds one line under the reply when something was left out or played down, such as a command that failed:
