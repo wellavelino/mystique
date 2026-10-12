@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { aimed, asked, bar, cleared, compact, elapsed, EMPTY, ended, filled, hasWork, isAsk, named, nearby, progress, reconciled, share, spent, stepped, tasked, tooled } from '../hooks/lib/board'
+import { aimed, asked, bar, cleared, compact, elapsed, EMPTY, ended, filled, hasWork, isAsk, isLive, named, nearby, progress, pulse, reconciled, share, spent, spinner, stepped, summary, sweep, tasked, tooled } from '../hooks/lib/board'
 
 const USAGE = { input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 40_000, cache_creation_input_tokens: 800 }
 
@@ -205,6 +205,58 @@ describe('elapsed', () => {
   })
 })
 
+describe('the engine’s own task list', () => {
+  test('is taken whole, each task keeping what it reads as while in progress', () => {
+    const known = tasked([], 'TaskCreate', { subject: 'Fix bug', activeForm: 'Fixing bug' }, { task: { id: '1' } })
+    const tasks = tasked(known, 'TaskList', {}, {
+      tasks: [
+        { id: '1', subject: 'Fix the bug', status: 'in_progress', blockedBy: [] },
+        { id: '3', subject: 'Add test', status: 'pending', blockedBy: ['1'] },
+      ],
+    })
+
+    expect(tasks).toEqual([
+      { id: '1', subject: 'Fix the bug', status: 'in_progress', active: 'Fixing bug' },
+      { id: '3', subject: 'Add test', status: 'pending', active: undefined },
+    ])
+    expect(tasked(tasks, 'TaskList', {}, { error: 'no list' })).toEqual(tasks)
+    expect(tasked(tasks, 'TaskList', {}, undefined)).toEqual(tasks)
+  })
+
+  test('says nothing when it is empty: a list kept from todos stays', () => {
+    const tasks = tasked([], 'TodoWrite', { todos: [{ content: 'a', status: 'pending', activeForm: 'A' }] }, {})
+
+    expect(tasked(tasks, 'TaskList', {}, { tasks: [] })).toEqual(tasks)
+  })
+
+  test('is the session’s, whoever reads it: a subagent’s reading fills the main list, not its card', () => {
+    const listed = { tasks: [{ id: '1', subject: 'Fix bug', status: 'in_progress', blockedBy: [] }] }
+    const board = tooled(stepped(EMPTY, 'agent-1', USAGE, 0), 'agent-1', 'TaskList', {}, listed, 0)
+
+    expect(board.tasks.map(task => task.subject)).toEqual(['Fix bug'])
+    expect(board.agents[0]).toMatchObject({ tools: 1, tasks: [] })
+
+    // Its later update of that task then lands on the main list too.
+    const after = tooled(board, 'agent-1', 'TaskUpdate', { taskId: '1', status: 'completed' }, { success: true }, 0)
+    expect(progress(after.tasks)).toEqual({ done: 1, total: 1, current: '' })
+  })
+})
+
+describe('a task’s words', () => {
+  test('are kept to a line’s length, however long they were written', () => {
+    const long = 'x'.repeat(5000)
+    const todo = tasked([], 'TodoWrite', { todos: [{ content: long, status: 'in_progress', activeForm: long }] }, {})[0]
+    const made = tasked([], 'TaskCreate', { subject: long, activeForm: long }, { task: { id: '1' } })[0]
+    const listed = tasked([], 'TaskList', {}, { tasks: [{ id: '1', subject: long, status: 'pending' }] })[0]
+    const updated = tasked([], 'TaskUpdate', { taskId: '9', subject: long, activeForm: long }, { success: true })[0]
+
+    for (const task of [todo, made, listed, updated]) {
+      expect(task?.subject.length).toBe(120)
+      expect((task?.active ?? '').length).toBeLessThanOrEqual(120)
+    }
+  })
+})
+
 describe('nearby', () => {
   const tasks = ['a', 'b', 'c', 'd', 'e', 'f'].map((id, index) => ({
     id,
@@ -212,11 +264,11 @@ describe('nearby', () => {
     status: index < 3 ? ('completed' as const) : ('pending' as const),
   }))
 
-  test('shows a short list whole', () => {
+  test('shows a list whole when it fits', () => {
     expect(nearby(tasks, 6)).toEqual({ before: 0, shown: tasks, after: 0 })
   })
 
-  test('opens a long list just before the first task not done', () => {
+  test('opens a list too long to draw just before the first task not done', () => {
     const window = nearby(tasks, 3)
 
     expect(window.shown.map(task => task.id)).toEqual(['c', 'd', 'e'])
@@ -227,5 +279,78 @@ describe('nearby', () => {
     const done = tasks.map(task => ({ ...task, status: 'completed' as const }))
 
     expect(nearby(done, 2).shown.map(task => task.id)).toEqual(['e', 'f'])
+  })
+})
+
+describe('sweep', () => {
+  test('moves a lit stretch along the bar and back, one cell a frame', () => {
+    expect(sweep(10, 0)).toEqual({ before: '', lit: '━━━', after: '───────' })
+    expect(sweep(10, 3)).toEqual({ before: '───', lit: '━━━', after: '────' })
+    expect(sweep(10, 7)).toEqual({ before: '───────', lit: '━━━', after: '' })
+    expect(sweep(10, 8).before).toBe('──────')
+    expect(sweep(10, 14)).toEqual(sweep(10, 0))
+  })
+
+  test('always fills its width, however narrow', () => {
+    for (const width of [1, 2, 3, 4, 10]) {
+      for (let frame = 0; frame < 30; frame += 1) {
+        const { before, lit, after } = sweep(width, frame)
+
+        expect(`${before}${lit}${after}`.length).toBe(width)
+      }
+    }
+  })
+})
+
+describe('pulse and spinner', () => {
+  test('give a cell that changes with the frame and comes round again', () => {
+    expect([0, 1, 2, 3, 4].map(pulse)).toEqual(['░', '▒', '▓', '▒', '░'])
+    expect(spinner(0)).not.toBe(spinner(1))
+    expect(spinner(10)).toBe(spinner(0))
+  })
+})
+
+describe('isLive', () => {
+  test('says whether anything on the board is being worked on', () => {
+    const waiting = tooled(EMPTY, undefined, 'TodoWrite', { todos: [{ content: 'a', status: 'pending', activeForm: 'A' }] }, {}, 0)
+    const working = tooled(EMPTY, undefined, 'TodoWrite', { todos: [{ content: 'a', status: 'in_progress', activeForm: 'A' }] }, {}, 0)
+    const running = stepped(EMPTY, 'agent-1', USAGE, 0)
+
+    expect([EMPTY, waiting, working, running, ended(running, 'agent-1', 'done', 5)].map(isLive)).toEqual([false, false, true, true, false])
+  })
+})
+
+describe('summary', () => {
+  test('says there is nothing yet on an empty board', () => {
+    expect(summary(EMPTY)).toBe('Panel opened: no tasks and no subagents on the board yet.')
+  })
+
+  test('lists the objective, every task and every subagent with its own', () => {
+    let board = aimed(asked(EMPTY, 'Ship the parser'), 'all parser tests pass')
+    board = tooled(board, undefined, 'TodoWrite', {
+      todos: [
+        { content: 'Write parser', status: 'completed', activeForm: 'Writing parser' },
+        { content: 'Write tests', status: 'in_progress', activeForm: 'Writing tests' },
+        { content: 'Ship', status: 'pending', activeForm: 'Shipping' },
+      ],
+    }, {}, 0)
+    board = named(stepped(board, 'agent-1', USAGE, 0), 'agent-1', 'Review the parser', 'Explore')
+    board = tooled(board, 'agent-1', 'TodoWrite', { todos: [{ content: 'Read it', status: 'pending', activeForm: 'Reading it' }] }, {}, 0)
+
+    expect(summary(board)).toBe([
+      'Panel opened: 1 of 3 tasks done · 1 subagent on the board.',
+      '◆ Goal: all parser tests pass',
+      '  ✔ Write parser',
+      '  ▸ Writing tests',
+      '  ○ Ship',
+      '↳ Review the parser · running · 0 of 1 tasks done',
+      '  ○ Read it',
+    ].join('\n'))
+  })
+
+  test('names the work by the prompt when there is no goal', () => {
+    const board = tooled(asked(EMPTY, 'Fix the login test'), undefined, 'TodoWrite', { todos: [{ content: 'a', status: 'completed', activeForm: 'A' }] }, {}, 0)
+
+    expect(summary(board)).toBe('Panel opened: 1 of 1 tasks done · 0 subagents on the board.\n◆ Working on: Fix the login test\n  ✔ a')
   })
 })

@@ -434,7 +434,7 @@ describe('the panel’s tabs', () => {
       await ui.unmount()
     }
 
-    expect((await $.command.run(typed('progress', ''))).text).toBe('Panel opened: 0 subagents on the board.')
+    expect((await $.command.run(typed('progress', ''))).text).toBe('Panel opened: no tasks and no subagents on the board yet.')
     expect(opened.at(-1)).toBe('mystique')
 
     const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })

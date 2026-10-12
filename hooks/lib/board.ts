@@ -12,6 +12,9 @@ export const EMPTY: Board = {
   limits: [],
 }
 
+/** The task tool the mod offers where the session has none: it takes a todo list whole. */
+export const TASKS_TOOL = 'mcp__mystique__tasks'
+
 const MAX_AGENTS = 24
 const MAX_TASKS = 200
 const MAX_LABEL = 120
@@ -98,23 +101,41 @@ export function aimed(board: Board, args: string): Board {
 const record = (value: unknown): Record<string, unknown> =>
   typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {}
 const text = (value: unknown) => (typeof value === 'string' ? value : '')
+// A task's words as the board keeps them: one line, a line long at most.
+const words = (value: unknown) => headline(text(value))
 const status = (value: unknown): Task['status'] =>
   value === 'in_progress' || value === 'completed' ? value : 'pending'
 
-/** `tasks` after one call of a task tool (TodoWrite, TaskCreate, TaskUpdate); any other tool leaves them. */
+/**
+ * `tasks` after one call of a task tool (TodoWrite, TaskCreate, TaskUpdate, TaskList); any other
+ * tool leaves them.
+ */
 export function tasked(tasks: readonly Task[], tool: string, input: unknown, result: unknown): Task[] {
   const given = record(input)
 
-  if (tool === 'TodoWrite' && Array.isArray(given.todos)) {
+  if ((tool === 'TodoWrite' || tool === TASKS_TOOL) && Array.isArray(given.todos)) {
     return given.todos.slice(0, MAX_TASKS).map((todo, index) => {
       const one = record(todo)
 
       return {
         id: String(index),
-        subject: text(one.content),
+        subject: words(one.content),
         status: status(one.status),
-        active: text(one.activeForm) || undefined,
+        active: words(one.activeForm) || undefined,
       }
+    })
+  }
+
+  const listed = record(result).tasks
+
+  // An empty list says nothing: a list kept from todos stays as it is.
+  if (tool === 'TaskList' && Array.isArray(listed) && listed.length > 0) {
+    return listed.slice(0, MAX_TASKS).map(entry => {
+      const one = record(entry)
+      const id = text(one.id)
+
+      // The list names no task's words for while it runs: those heard at its making are kept.
+      return { id, subject: words(one.subject), status: status(one.status), active: tasks.find(task => task.id === id)?.active }
     })
   }
 
@@ -125,7 +146,7 @@ export function tasked(tasks: readonly Task[], tool: string, input: unknown, res
       ? [...tasks]
       : [
           ...tasks,
-          { id, subject: text(given.subject), status: 'pending' as const, active: text(given.activeForm) || undefined },
+          { id, subject: words(given.subject), status: 'pending' as const, active: words(given.activeForm) || undefined },
         ].slice(-MAX_TASKS)
   }
 
@@ -144,9 +165,9 @@ export function tasked(tasks: readonly Task[], tool: string, input: unknown, res
     const known = tasks.find(task => task.id === id) ?? { id, subject: `task ${id}`, status: 'pending' as const }
     const changed: Task = {
       ...known,
-      subject: text(given.subject) || known.subject,
+      subject: words(given.subject) || known.subject,
       status: given.status === undefined ? known.status : status(given.status),
-      active: text(given.activeForm) || known.active,
+      active: words(given.activeForm) || known.active,
     }
 
     return tasks.some(task => task.id === id)
@@ -260,11 +281,13 @@ export function tooled(
     return { ...board, tasks: tasked(board.tasks, tool, input, result) }
   }
 
-  // The task tools keep one list for the session: an agent that updates a main task changes that.
+  // The task tools keep one list for the session: an agent that reads it, or updates a main task,
+  // changes the main list and not its own.
   const id = tool === 'TaskUpdate' ? text(record(input).taskId) : ''
   const row = board.agents.find(agent => agent.id === agentId)
   const isMain =
-    id !== '' && board.tasks.some(task => task.id === id) && row?.tasks.some(task => task.id === id) !== true
+    tool === 'TaskList' ||
+    (id !== '' && board.tasks.some(task => task.id === id) && row?.tasks.some(task => task.id === id) !== true)
   const booked = isMain ? { ...board, tasks: tasked(board.tasks, tool, input, result) } : board
 
   return withAgent(booked, agentId, now, agent => ({
@@ -329,8 +352,8 @@ export function elapsed(ms: number): string {
 }
 
 /**
- * The stretch of a task list worth drawing in `room` rows: it opens just before the first task
- * not yet done, so what was just finished, what runs and what comes next all show.
+ * The stretch of a task list drawn in `room` rows when it is longer: it opens just before the
+ * first task not yet done, so what was just finished, what runs and what comes next all show.
  */
 export function nearby(tasks: readonly Task[], room: number): { before: number; shown: Task[]; after: number } {
   if (tasks.length <= room) {
@@ -341,6 +364,75 @@ export function nearby(tasks: readonly Task[], room: number): { before: number; 
   const from = Math.min(Math.max(0, (open === -1 ? tasks.length : open) - 1), tasks.length - room)
 
   return { before: from, shown: tasks.slice(from, from + room), after: tasks.length - from - room }
+}
+
+const LIT = 3
+
+/**
+ * A bar of `width` cells for work with no measure: a lit stretch that moves one cell a frame,
+ * to the end and back.
+ */
+export function sweep(width: number, frame: number): { before: string; lit: string; after: string } {
+  const lit = Math.min(LIT, width)
+  const reach = width - lit
+  const step = reach === 0 ? 0 : frame % (2 * reach)
+  const at = step > reach ? 2 * reach - step : step
+
+  return { before: '─'.repeat(at), lit: '━'.repeat(lit), after: '─'.repeat(reach - at) }
+}
+
+const PULSE = ['░', '▒', '▓', '▒']
+const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+/** The cell at a bar's growing edge, at `frame`: it swells and fades while the work goes on. */
+export function pulse(frame: number): string {
+  return PULSE[frame % PULSE.length] ?? '░'
+}
+
+/** The mark of a thread at work, at `frame`. */
+export function spinner(frame: number): string {
+  return SPINNER[frame % SPINNER.length] ?? '⠋'
+}
+
+/** Whether anything on the board is being worked on now: a task in progress, an agent running. */
+export function isLive(board: Board): boolean {
+  const isDoing = (tasks: readonly Task[]) => tasks.some(task => task.status === 'in_progress')
+
+  return isDoing(board.tasks) || board.agents.some(agent => agent.status === 'running' || isDoing(agent.tasks))
+}
+
+const count = (tasks: readonly Task[]) => `${progress(tasks).done} of ${tasks.length} tasks done`
+const listed = (tasks: readonly Task[]) =>
+  tasks.map(task =>
+    task.status === 'completed'
+      ? `  ✔ ${task.subject}`
+      : task.status === 'in_progress'
+        ? `  ▸ ${task.active || task.subject}`
+        : `  ○ ${task.subject}`,
+  )
+
+/** The board in words, as /progress answers: the objective, every task, every subagent and its own. */
+export function summary(board: Board): string {
+  if (board.tasks.length === 0 && board.agents.length === 0) {
+    return 'Panel opened: no tasks and no subagents on the board yet.'
+  }
+
+  const agents = `${board.agents.length} subagent${board.agents.length === 1 ? '' : 's'}`
+  const aim = board.goal === null ? board.ask && `◆ Working on: ${board.ask}` : `◆ Goal: ${board.goal}`
+
+  return [
+    `Panel opened: ${board.tasks.length === 0 ? 'no tasks' : count(board.tasks)} · ${agents} on the board.`,
+    aim,
+    ...listed(board.tasks),
+    ...board.agents.flatMap(agent => [
+      [`↳ ${agent.label || 'agent'}`, agent.status, agent.tasks.length > 0 ? count(agent.tasks) : '']
+        .filter(part => part !== '')
+        .join(' · '),
+      ...listed(agent.tasks),
+    ]),
+  ]
+    .filter(line => line !== '')
+    .join('\n')
 }
 
 /** Whether the band has anything to say. */

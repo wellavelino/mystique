@@ -13,12 +13,19 @@ import {
   ended,
   hasWork,
   isAsk,
+  isLive,
   named,
   nearby,
   progress,
+  pulse,
   reconciled,
   share,
+  spinner,
   stepped,
+  summary,
+  sweep,
+  tasked,
+  TASKS_TOOL,
   tooled,
 } from './lib/board'
 import type { Usage } from './lib/board'
@@ -47,17 +54,22 @@ const WINDOW = 100
 const MAX_TABLES = 10
 const MAX_RECORD = 50_000
 const START: View = { tab: 'tables', tableId: null, shown: PAGE, column: 0, row: null }
-const MAX_TASK_ROWS = 8
 const MAX_READINGS = 40
 const MIN_REVIEWED_REPLY = 200
 const MAX_AGENT_ROWS = 6
-const TASK_TOOLS = new Set(['TodoWrite', 'TaskCreate', 'TaskUpdate'])
+const TASK_TOOLS = new Set(['TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList'])
+// What moves in the panel moves four times a second, and each task's own bar is this wide.
+const TICK = 250
+const TASK_BAR = 10
+// The task rows one drawing holds: a longer list shows the stretch around the task in progress.
+const MAX_TASK_ROWS = 60
 
 const tables = atom({ plugin: 'mystique', key: 'tables' } as const, [])
 const view = atom({ plugin: 'mystique', key: 'view' } as const, START)
 const pens = atom({ plugin: 'mystique', key: 'pens' } as const, [])
 const readings = atom({ plugin: 'mystique', key: 'readings' } as const, [])
 const board = atom({ plugin: 'mystique', key: 'board' } as const, EMPTY)
+const frame = atom({ plugin: 'mystique', key: 'frame' } as const, 0)
 const isDismissed = atom({ plugin: 'mystique', key: 'isDismissed' } as const, false)
 const ROWS = { plugin: 'mystique', key: 'rows' } as const
 
@@ -71,7 +83,61 @@ const INKS: Record<string, string> = {
 }
 const INK_TEXT = '#141414'
 
+const OWN_TASKS = new RegExp(`^${TASKS_TOOL}$`)
+
+// The task tool the model is given where Claude Code has none of its own, as the model reads it.
+const TASKS_SPEC = {
+  name: 'tasks',
+  description:
+    'Keeps the task list the person watches in their progress panel. Use it for work of three or more steps: call it once with every step "pending", then again whenever a step starts ("in_progress", one at a time) or is finished ("completed"). Always send the whole list. Do not use it for single-step work, or to report results.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      todos: {
+        type: 'array',
+        description: 'Every task of the list, in order.',
+        items: {
+          type: 'object',
+          properties: {
+            content: { type: 'string', description: 'The task, as an instruction: "Run the tests".' },
+            status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+            activeForm: { type: 'string', description: 'The task while it runs: "Running the tests".' },
+          },
+          required: ['content', 'status'],
+        },
+      },
+    },
+    required: ['todos'],
+  },
+  isDeferred: false,
+}
+
 type Captured = { title: string; source: string; table: ParsedTable }
+
+// The next frame of the panel's moving marks, once asked for, and when.
+let pending: { timer: { cancel: () => void }; at: number } | null = null
+// Whether the task list is being read for the board: a call of the mod's own, not the assistant's.
+let isRefreshing = false
+
+/** Reads the engine's own task list onto the board, where the session has the tool for it. */
+async function refresh($: EngineInterface): Promise<void> {
+  try {
+    if (!(await $.tool.list()).some(tool => tool.name === 'TaskList')) {
+      return
+    }
+
+    isRefreshing = true
+    const ran = await $.tool.call({ tool: 'TaskList' })
+
+    if (ran.deny === undefined && ran.isError !== true) {
+      await update($, board, held => ({ ...held, tasks: tasked(held.tasks, 'TaskList', {}, ran.result) }))
+    }
+  } catch {
+    // Without the list the board shows what it heard of.
+  } finally {
+    isRefreshing = false
+  }
+}
 
 /**
  * Opens the panel on `tab`, unless the person closed it by hand. A panel already open keeps the
@@ -264,6 +330,7 @@ export const register: Register = (on, options) => {
   const capture = String(options.capture ?? 'databases')
   const hasBand = String(options.band ?? 'on') !== 'off'
   const isAuto = String(options.panel ?? 'auto') !== 'manual'
+  const hasTasks = String(options.tasks ?? 'auto') !== 'off'
   const reader = String(options.reader ?? 'fast')
   const readerModel = String(options.readerModel ?? 'haiku') || 'haiku'
   // The tool calls since the person last asked, for a reader that cannot see them.
@@ -286,7 +353,54 @@ export const register: Register = (on, options) => {
       argumentHint: '[phrase | clear]',
     })
 
+    // A session whose model has no task list tool gets the mod's own, so there is a list to show.
+    if (hasTasks) {
+      try {
+        const hasOwn = (await $.tool.list()).some(tool => tool.name === 'TodoWrite' || tool.name === 'TaskCreate')
+
+        if (!hasOwn) {
+          await $.tool.register(TASKS_SPEC)
+        }
+      } catch {
+        return next(e)
+      }
+    }
+
     return next(e)
+  })
+
+  // The mod's own tool is in no table of tools the types know: it is matched by its name's pattern.
+  // It only keeps a list for the person to watch, so it needs no asking; a rule against it stands.
+  on('tool.check', { tool: OWN_TASKS }, async ($, e, next) => {
+    const decided = await next(e)
+
+    return decided.decision === 'ask' ? { ...decided, decision: 'allow' } : decided
+  })
+
+  on('tool.call', { tool: OWN_TASKS }, async ($, e) => {
+    const given: { todos?: unknown; agentId?: string } = e
+
+    if (!Array.isArray(given.todos)) {
+      const text = 'Send the whole list as "todos": an array of { content, status, activeForm }.'
+
+      return { result: text, text, isError: true }
+    }
+
+    const now = await $.clock.now()
+    let kept: Task[] = []
+
+    await update($, board, held => {
+      const booked = tooled(held, e.agentId, TASKS_TOOL, e, {}, now)
+      kept = e.agentId === undefined ? booked.tasks : (booked.agents.find(agent => agent.id === e.agentId)?.tasks ?? [])
+
+      return booked
+    })
+
+    const { done, total, current } = progress(kept)
+    const text = `Task list kept: ${done} of ${total} done${current === '' ? '' : `, now: ${current}`}.`
+
+    // A tool served as an MCP one answers in text.
+    return { result: text, text }
   })
 
   // The highlighter -----------------------------------------------------------------------
@@ -614,6 +728,11 @@ export const register: Register = (on, options) => {
     const agentId = e.agentId
     const isFailed = ran.deny !== undefined || ran.isError === true
 
+    // The mod's own task calls are no work of the assistant's, and are booked where they are served.
+    if ((isRefreshing && tool === 'TaskList') || tool === TASKS_TOOL) {
+      return ran
+    }
+
     // What the mod misses is never worth a tool call: a step of its own that fails is dropped.
     try {
       digest = counted(digest, tool, agentId !== undefined, isFailed ? (ran.deny ?? ran.text ?? '') : undefined)
@@ -738,10 +857,10 @@ export const register: Register = (on, options) => {
     }
 
     await update($, isDismissed, () => false)
+    await refresh($)
     await reveal($, 'agents', true)
-    const count = (await read($, board)).agents.length
 
-    return { text: `Panel opened: ${count} subagent${count === 1 ? '' : 's'} on the board.` }
+    return { text: summary(await read($, board)) }
   })
 
   on('ui.close', { id: PANE }, async ($, e, next) => {
@@ -749,6 +868,9 @@ export const register: Register = (on, options) => {
     if (e.origin.kind === 'person') {
       await update($, isDismissed, () => true)
     }
+
+    pending?.timer.cancel()
+    pending = null
 
     return next(e)
   })
@@ -792,10 +914,32 @@ export const register: Register = (on, options) => {
 
     if (tab === 'agents') {
       const now = await $.clock.now()
+      const isMoving = isLive(work)
+      const at = isMoving ? await read($, frame) : 0
+
+      // What moves is drawn again a frame later: the write draws the panel, which asks for the
+      // next, so the frames stop by themselves when the panel goes or the work is done. A frame
+      // asked for long ago never came, and is asked for again.
+      if (isMoving && (pending === null || now - pending.at > 8 * TICK)) {
+        pending?.timer.cancel()
+
+        const timer = $.clock.after(TICK, () => {
+          if (pending?.timer === timer) {
+            pending = null
+          }
+
+          update($, frame, count => count + 1).catch(() => undefined)
+        })
+
+        pending = { timer, at: now }
+      }
+
       const span = Math.max(8, Math.min(24, room - 36))
       const heat = (percent: number) => (percent >= 90 ? 'error' : percent >= 70 ? 'warning' : 'success')
-      const stat = (name: string, fraction: number | null, color: string, text: string) => {
+      const stat = (name: string, fraction: number | null, color: string, text: string, hasEdge = false) => {
         const drawn = bar(fraction ?? 0, span)
+        // The cell a bar grows into next swells and fades while the work on it goes on.
+        const edge = hasEdge && drawn.rest !== '' ? pulse(at) : ''
 
         return (
           <Box flexDirection="row">
@@ -805,7 +949,8 @@ export const register: Register = (on, options) => {
             {fraction !== null && (
               <Box marginRight={1} flexShrink={0}>
                 <Text color={color}>{drawn.full}</Text>
-                <Text dimColor>{drawn.rest}</Text>
+                {edge !== '' && <Text color={color}>{edge}</Text>}
+                <Text dimColor>{edge === '' ? drawn.rest : drawn.rest.slice(1)}</Text>
               </Box>
             )}
             <Box flexShrink={1}>
@@ -834,9 +979,64 @@ export const register: Register = (on, options) => {
       const steps = (tasks: readonly Task[]) => {
         const { done, total } = progress(tasks)
 
-        return total > 0 && stat('tasks', done / total, 'success', `${done}/${total}`)
+        return (
+          total > 0 &&
+          stat('tasks', done / total, 'success', `${done}/${total}`, tasks.some(task => task.status === 'in_progress'))
+        )
       }
-      const todo = nearby(work.tasks, MAX_TASK_ROWS)
+      // A task has no measure of its own: done is a full bar, in progress a moving one.
+      const track = (task: Task) => {
+        if (task.status !== 'in_progress') {
+          return task.status === 'completed' ? (
+            <Text color="success">{'━'.repeat(TASK_BAR)}</Text>
+          ) : (
+            <Text dimColor>{'─'.repeat(TASK_BAR)}</Text>
+          )
+        }
+
+        const moving = sweep(TASK_BAR, at)
+
+        return (
+          <Text>
+            <Text dimColor>{moving.before}</Text>
+            <Text color="claude">{moving.lit}</Text>
+            <Text dimColor>{moving.after}</Text>
+          </Text>
+        )
+      }
+      const row = (task: Task) => (
+          <Box flexDirection="row">
+            <Box width={2} flexShrink={0}>
+              {task.status === 'completed' ? (
+                <Text color="success">✔</Text>
+              ) : task.status === 'in_progress' ? (
+                <Text color="claude">▸</Text>
+              ) : (
+                <Text dimColor>○</Text>
+              )}
+            </Box>
+            <Box flexGrow={1} flexShrink={1}>
+              <Text bold={task.status === 'in_progress'} dimColor={task.status === 'completed'} wrap="truncate-end">
+                {task.status === 'in_progress' ? task.active || task.subject : task.subject}
+              </Text>
+            </Box>
+            <Box marginLeft={1} flexShrink={0}>
+              {track(task)}
+            </Box>
+          </Box>
+      )
+      const todos = (tasks: readonly Task[], room: number) => {
+        const near = nearby(tasks, room)
+
+        return [
+          near.before > 0 && <Text dimColor>{`  … ${near.before} done before`}</Text>,
+          ...near.shown.map(row),
+          near.after > 0 && <Text dimColor>{`  … ${near.after} more to do`}</Text>,
+        ]
+      }
+      // The agents' lists share as many rows as the main list has to itself.
+      const listing = work.agents.filter(agent => agent.tasks.length > 0).length
+      const agentRows = Math.max(3, Math.floor(MAX_TASK_ROWS / Math.max(1, listing)))
       const limits = work.limits
         .filter(limit => limit.kind === 'five_hour' || limit.kind === 'seven_day')
         .map(limit => `${limit.kind === 'five_hour' ? '5h' : '7d'} ${Math.round(limit.percent)}%`)
@@ -855,30 +1055,12 @@ export const register: Register = (on, options) => {
             </Text>
             <Text wrap="wrap">{work.goal ?? (work.ask || 'Nothing yet. Your next prompt shows here.')}</Text>
             {work.tasks.length > 0 && <Box marginTop={1}>{steps(work.tasks)}</Box>}
-            {todo.before > 0 && <Text dimColor>  … {todo.before} done before</Text>}
-            {todo.shown.map(task => (
-              <Box flexDirection="row">
-                <Box width={2} flexShrink={0}>
-                  {task.status === 'completed' ? (
-                    <Text color="success">✔</Text>
-                  ) : task.status === 'in_progress' ? (
-                    <Text color="claude">▸</Text>
-                  ) : (
-                    <Text dimColor>○</Text>
-                  )}
-                </Box>
-                <Box flexShrink={1}>
-                  <Text
-                    bold={task.status === 'in_progress'}
-                    dimColor={task.status === 'completed'}
-                    wrap="truncate-end"
-                  >
-                    {task.status === 'in_progress' ? task.active || task.subject : task.subject}
-                  </Text>
-                </Box>
-              </Box>
-            ))}
-            {todo.after > 0 && <Text dimColor>  … {todo.after} more to do</Text>}
+            {todos(work.tasks, MAX_TASK_ROWS)}
+            {work.tasks.length === 0 && (
+              <Text dimColor wrap="wrap">
+                No task list yet. Claude keeps one for work with several steps, and each task shows here.
+              </Text>
+            )}
           </Box>
           <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
             <Text bold>Main thread</Text>
@@ -905,7 +1087,7 @@ export const register: Register = (on, options) => {
               <Box flexDirection="column" borderStyle="round" borderColor={color} borderDimColor={!isRunning} paddingX={1}>
                 <Box flexDirection="row">
                   <Box width={2} flexShrink={0}>
-                    <Text color={color}>{isRunning ? '●' : agent.status === 'failed' ? '✖' : '✔'}</Text>
+                    <Text color={color}>{isRunning ? spinner(at) : agent.status === 'failed' ? '✖' : '✔'}</Text>
                   </Box>
                   <Box flexGrow={1} flexShrink={1}>
                     <Text bold wrap="truncate-end">
@@ -930,6 +1112,7 @@ export const register: Register = (on, options) => {
                 {context(agent.context, false)}
                 {use(agent.used)}
                 {steps(agent.tasks)}
+                {todos(agent.tasks, agentRows)}
               </Box>
             )
           })}
