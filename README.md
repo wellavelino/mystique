@@ -51,6 +51,8 @@ Marks last for the session.
 
 It opens beside the transcript (docked in the fullscreen layout, above the prompt otherwise) when there is something to show: a query result, or a subagent starting. On a narrow terminal an unasked panel waits instead of taking the screen, and a toast tells you a table was captured. Set **Panel** to `manual` in `/config` and it opens only when you ask for it.
 
+<img width="985" height="320" alt="image" src="https://github.com/user-attachments/assets/24b6fa38-b39c-4c83-a4c0-2b835f4d0e51" />
+
 | Command | What it does |
 | --- | --- |
 | `/tables` | Opens the panel on the tables captured so far. |
@@ -67,6 +69,8 @@ Run a query the way you always do, or let Claude run it:
 ```
 > how many moons does each planet have? the db is ./space.db
 ```
+<img width="984" height="610" alt="image" src="https://github.com/user-attachments/assets/734b2e96-cdc6-4adf-a2c4-445999f83949" />
+
 
 | Button | Key | What it does |
 | --- | --- | --- |
