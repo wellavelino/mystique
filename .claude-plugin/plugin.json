@@ -1,0 +1,96 @@
+{
+  "name": "mystique",
+  "version": "0.1.0",
+  "description": "A highlighter pen for Claude's replies, and a side panel for query results as tables and for the goal, the tasks and every subagent.",
+  "author": {
+    "name": "wellavelino",
+    "url": "https://github.com/wellavelino"
+  },
+  "license": "MIT",
+  "keywords": [
+    "highlight",
+    "database",
+    "table",
+    "pane",
+    "progress",
+    "subagents",
+    "context",
+    "mod"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "highlight": {
+      "type": "string",
+      "title": "Highlighter",
+      "description": "Who marks what matters in a reply. reader: a second, small model reads each reply after the turn and marks it. claude: the replying model marks its own text as it writes (no extra call; adds a short section to the system prompt). both: the two together. bold: every bold phrase. off: only your own /highlight marks.",
+      "options": [
+        "reader",
+        "claude",
+        "both",
+        "bold",
+        "off"
+      ],
+      "default": "reader"
+    },
+    "color": {
+      "type": "string",
+      "title": "Pen color",
+      "description": "The color of the highlighter pen.",
+      "options": [
+        "yellow",
+        "green",
+        "pink",
+        "blue",
+        "orange"
+      ],
+      "default": "yellow"
+    },
+    "reader": {
+      "type": "string",
+      "title": "Second reader",
+      "description": "What the second reader is. fast: the model named below, which sees the reply, what you asked and a digest of the turn's tool calls. session: a fork of the session on its own model, which sees the whole conversation and costs a cached re-read of it.",
+      "options": [
+        "fast",
+        "session"
+      ],
+      "default": "fast"
+    },
+    "readerModel": {
+      "type": "string",
+      "title": "Second reader model",
+      "description": "The model the fast second reader uses: an alias (haiku) or a full model id.",
+      "default": "haiku"
+    },
+    "capture": {
+      "type": "string",
+      "title": "Table capture",
+      "description": "Which results the data panel picks up. databases: database clients and database MCP tools. everything: any table-shaped tool output. off: none.",
+      "options": [
+        "databases",
+        "everything",
+        "off"
+      ],
+      "default": "databases"
+    },
+    "band": {
+      "type": "string",
+      "title": "Progress band",
+      "description": "The band above the prompt: the goal, a task progress bar, and for the main thread and each subagent its context and its share of what the session spent.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "on"
+    },
+    "panel": {
+      "type": "string",
+      "title": "Panel",
+      "description": "When the side panel opens. auto: by itself, for a query result or a new subagent. manual: only when you type /tables or /progress (a toast tells you a table was captured).",
+      "options": [
+        "auto",
+        "manual"
+      ],
+      "default": "auto"
+    }
+  }
+}
