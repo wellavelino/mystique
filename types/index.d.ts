@@ -79,6 +79,8 @@ declare module 'claude-code' {
       pens: string[]
       readings: Reading[]
       board: Board
+      /** The frame the panel's moving marks are drawn at; it counts on only while something moves. */
+      frame: number
       isDismissed: boolean
     }
   }

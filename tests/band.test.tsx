@@ -33,7 +33,7 @@ const typed = (command: string, args: string) =>
     presentation: { isFullscreen: true, columns: 160 },
   }) as const
 
-type Said = { logs: string[]; opened: string[]; asks: { model?: string; prompt: string }[] }
+type Said = { logs: string[]; opened: string[]; asks: { model?: string; prompt: string }[]; calls: string[]; tools: string[]; registered: { name: string; isDeferred?: boolean }[] }
 
 /** The engine beneath the mod: turns, model requests that report `usage`, agents, and a model to ask. */
 function world(
@@ -41,7 +41,7 @@ function world(
   reply = '{"highlights": [], "missed": ""}',
   surfaces: readonly ('terminal' | 'desktop')[] = ['terminal'],
 ): Said & { clock: ReturnType<typeof mock.clock> } {
-  const said: Said = { logs: [], opened: [], asks: [] }
+  const said: Said = { logs: [], opened: [], asks: [], calls: [], tools: [], registered: [] }
   const clock = mock.clock(on, { now: 1000 })
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
@@ -55,7 +55,25 @@ function world(
       usage: usage(e.agentId === undefined ? 40_000 : 10_000),
     }
   })
-  on('tool.call', ($, e) => ({ result: e.tool === 'TaskCreate' ? { task: { id: String(e.subject), subject: e.subject } } : { success: true }, text: 'ok' }))
+  on('tool.call', ($, e) => {
+    said.calls.push(String(e.tool))
+
+    if (e.tool === 'TaskList') {
+      return {
+        result: {
+          tasks: [
+            { id: '1', subject: 'Reproduce', status: 'completed', blockedBy: [] },
+            { id: '2', subject: 'Fix', status: 'pending', blockedBy: ['1'] },
+          ],
+        },
+        text: 'ok',
+      }
+    }
+
+    return { result: e.tool === 'TaskCreate' ? { task: { id: String(e.subject), subject: e.subject } } : { success: true }, text: 'ok' }
+  })
+  // The tools the session has: none of the task tools unless a test names them.
+  on('tool.list', () => ({ value: said.tools.map(name => ({ name, description: '' })) as never }))
   on('command.run', { command: 'goal' }, () => ({ text: 'Goal set.' }))
   on('session.usage', () => ({
     value: {
@@ -64,6 +82,13 @@ function world(
       rateLimits: [{ kind: 'five_hour', percentUsed: 34.5 }],
     },
   }))
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('tool.register', ($, e) => {
+    said.registered.push({ name: e.name, isDeferred: e.isDeferred })
+
+    return { value: { tool: `mcp__mystique__${e.name}` } }
+  })
   on('session.surfaces', () => ({ value: surfaces }))
   on('agent.list', () => ({
     value: [{ id: 'agent-1', description: 'Review the parser', type: 'general-purpose', status: 'running' }],
@@ -300,7 +325,7 @@ describe('the agents board', () => {
     await drain($.turn.step({ ...step, agentId: 'agent-1' }))
     expect(said.opened).toEqual([])
 
-    expect((await $.command.run(typed('progress', ''))).text).toBe('Panel opened: 1 subagent on the board.')
+    expect((await $.command.run(typed('progress', ''))).text).toBe('Panel opened: no tasks · 1 subagent on the board.\n◆ Working on: Review the parser\n↳ Review the parser · running')
     expect(said.opened).toEqual(['mystique'])
   })
 
@@ -328,6 +353,227 @@ describe('the agents board', () => {
 
     const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
     expect((await ui.find({ type: 'Text' }))?.text).toBe('engine band')
+    await ui.unmount()
+  })
+})
+
+const TODOS = Array.from({ length: 12 }, (_, index) => ({
+  content: `Step ${index + 1}`,
+  status: index < 2 ? 'completed' : index === 2 ? 'in_progress' : 'pending',
+  activeForm: `Doing step ${index + 1}`,
+}))
+
+describe('the task list in the panel', () => {
+  test('lists every task with a bar of its own, and moves the bar of the one in progress', async ($, on) => {
+    const said = world(on)
+    await $.turn.start({ text: 'Ship the parser', turnId: 'turn-1' })
+    await $.tool.call({ tool: 'TodoWrite', todos: TODOS } as never)
+    await $.command.run(typed('progress', ''))
+
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...PANE, surface })
+      const texts = async () => (await ui.findAll({ type: 'Text' })).map(text => text.text)
+      const moving = async () => (await texts()).find(text => /^─*━━━─*$/.test(text))
+
+      for (const todo of TODOS) {
+        expect(await texts()).toContain(todo.status === 'in_progress' ? todo.activeForm : todo.content)
+      }
+
+      expect((await texts()).some(text => /more to do|done before/.test(text))).toBe(false)
+      expect((await texts()).filter(text => text === '━━━━━━━━━━').length).toBe(2)
+      expect((await texts()).filter(text => text === '──────────').length).toBe(9)
+
+      const before = await moving()
+      expect(before?.length).toBe(10)
+
+      await said.clock.advance(250)
+      const after = await moving()
+      expect(after?.length).toBe(10)
+      expect(after).not.toBe(before)
+      await ui.unmount()
+    }
+
+    // With the panel gone nothing keeps the frames coming: a look asks for one more, and no more
+    // than that one comes however long the panel then stays away.
+    const glance = async () => {
+      const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+      const at = (await ui.findAll({ type: 'Text' })).map(text => text.text).find(text => /^─*━━━─*$/.test(text))?.indexOf('━')
+      await ui.unmount()
+
+      return at ?? -1
+    }
+
+    await said.clock.advance(1000)
+    const first = await glance()
+    await said.clock.advance(5000)
+    expect(await glance()).toBe(first + 1)
+  })
+
+  test('draws no moving bar and counts no frames while nothing is in progress', async ($, on) => {
+    const said = world(on)
+    await $.tool.call({ tool: 'TodoWrite', todos: TODOS.map(todo => ({ ...todo, status: 'pending' })) } as never)
+    await $.command.run(typed('progress', ''))
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    await said.clock.advance(2000)
+
+    expect((await ui.findAll({ type: 'Text' })).some(text => /━━━/.test(text.text))).toBe(false)
+
+    // No frame was counted meanwhile: the first bar to move starts from its first cell.
+    await $.tool.call({ tool: 'TodoWrite', todos: TODOS } as never)
+    expect((await ui.findAll({ type: 'Text' })).map(text => text.text)).toContain('━━━───────')
+    await ui.unmount()
+  })
+
+  test('lists a subagent’s own tasks in its card, and turns its mark while it runs', async ($, on) => {
+    const said = world(on)
+    await drain($.turn.step({ ...step, agentId: 'agent-1' }))
+    await $.tool.call({
+      tool: 'TodoWrite',
+      todos: [
+        { content: 'Read the parser', status: 'completed', activeForm: 'Reading the parser' },
+        { content: 'Write the report', status: 'in_progress', activeForm: 'Writing the report' },
+      ],
+      agentId: 'agent-1',
+    } as never)
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const texts = async () => (await ui.findAll({ type: 'Text' })).map(text => text.text)
+
+    expect(await texts()).toContain('Read the parser')
+    expect(await texts()).toContain('Writing the report')
+    expect(await texts()).toContain('⠋')
+    // On its card, not on the main list.
+    expect((await $.command.run(typed('progress', ''))).text).toMatch(/: no tasks ·[\s\S]*↳ Review the parser · running · 1 of 2 tasks done\n  ✔ Read the parser\n  ▸ Writing the report$/)
+
+    await said.clock.advance(250)
+    expect(await texts()).toContain('⠙')
+    expect(await texts()).not.toContain('⠋')
+    await ui.unmount()
+  })
+
+  test('reads the engine’s own task list on /progress, where the session has one', async ($, on) => {
+    const said = world(on)
+    said.tools.push('TaskList')
+    await $.turn.start({ text: 'Fix the flaky login test', turnId: 'turn-1' })
+
+    expect((await $.command.run(typed('progress', ''))).text).toBe(
+      'Panel opened: 1 of 2 tasks done · 0 subagents on the board.\n◆ Working on: Fix the flaky login test\n  ✔ Reproduce\n  ○ Fix',
+    )
+    expect(said.calls).toEqual(['TaskList'])
+
+    // A call of the mod's own is no work of the assistant's: the second reader's count leaves it out.
+    await $.turn.complete(done)
+    await said.clock.advance(1000)
+    expect(said.asks[0]?.prompt).toMatch(/made 0 tool calls itself/)
+  })
+
+  test('asks for no task list where the session has no such tool', async ($, on) => {
+    const said = world(on)
+
+    expect((await $.command.run(typed('progress', ''))).text).toBe('Panel opened: no tasks and no subagents on the board yet.')
+    expect(said.calls).toEqual([])
+  })
+})
+
+const START = { cwd: '/work', surface: 'terminal', isInteractive: true } as const
+
+describe('the mod’s own task tool', () => {
+  test('is offered, in the prompt’s tool list, where the session has no task list tool', async ($, on) => {
+    const said = world(on)
+    said.tools.push('Bash', 'TaskStop')
+    await $.session.start(START)
+
+    expect(said.registered).toEqual([{ name: 'tasks', isDeferred: false }])
+  })
+
+  test('is not offered where Claude Code keeps a task list itself', async ($, on) => {
+    const said = world(on)
+    said.tools.push('Bash', 'TaskCreate')
+    await $.session.start(START)
+
+    expect(said.registered).toEqual([])
+  })
+
+  test('is not offered when turned off', { options: { tasks: 'off' } }, async ($, on) => {
+    const said = world(on)
+    await $.session.start(START)
+
+    expect(said.registered).toEqual([])
+  })
+
+  test('keeps the list the model sends, shows it, and answers how far the work is', async ($, on) => {
+    const said = world(on)
+    await $.turn.start({ text: 'Ship the parser', turnId: 'turn-1' })
+    const ran = await $.tool.call({ tool: 'mcp__mystique__tasks', todos: TODOS } as never)
+
+    expect(ran.text).toBe('Task list kept: 2 of 12 done, now: Doing step 3.')
+    expect(ran.result).toBe('Task list kept: 2 of 12 done, now: Doing step 3.')
+    expect(ran.isError).toBeUndefined()
+    // Answered by the mod: no tool of the engine's ran.
+    expect(said.calls).toEqual([])
+
+    const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect((await band.findAll({ type: 'Text' })).some(text => /2\/12/.test(text.text))).toBe(true)
+    await band.unmount()
+
+    await $.command.run(typed('progress', ''))
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect((await ui.findAll({ type: 'Text' })).map(text => text.text)).toContain('Doing step 3')
+    await ui.unmount()
+  })
+
+  test('books a subagent’s list on its own card', async ($, on) => {
+    world(on)
+    await drain($.turn.step({ ...step, agentId: 'agent-1' }))
+    await $.tool.call({ tool: 'mcp__mystique__tasks', todos: TODOS.slice(0, 3), agentId: 'agent-1' } as never)
+
+    expect((await $.command.run(typed('progress', ''))).text).toMatch(/↳ Review the parser · running · 2 of 3 tasks done/)
+  })
+
+  test('tells the model what to send when the list is missing', async ($, on) => {
+    world(on)
+    const ran = await $.tool.call({ tool: 'mcp__mystique__tasks' } as never)
+
+    expect(ran.isError).toBe(true)
+    expect(ran.text).toMatch(/todos/)
+    expect(ran.result).toBe(ran.text)
+  })
+
+  test('answers a permission check for its own tool, and no other, with allow', async ($, on) => {
+    world(on)
+    on('tool.check', () => ({ decision: 'ask' }))
+
+    expect((await $.tool.check({ tool: 'mcp__mystique__tasks', input: { todos: [] } } as never)).decision).toBe('allow')
+    expect((await $.tool.check({ tool: 'Bash', input: { command: 'ls' } } as never)).decision).toBe('ask')
+  })
+
+  test('leaves a rule that denies its tool standing', async ($, on) => {
+    world(on)
+    on('tool.check', () => ({ decision: 'deny', reason: 'a rule of the person’s' }))
+
+    expect(await $.tool.check({ tool: 'mcp__mystique__tasks', input: { todos: [] } } as never)).toMatchObject({ decision: 'deny', reason: 'a rule of the person’s' })
+  })
+
+  test('draws a very long list within what one drawing holds, and says what it left out', async ($, on) => {
+    world(on)
+    const many = Array.from({ length: 200 }, (_, index) => ({
+      content: `Step ${index + 1} ${'x'.repeat(300)}`,
+      status: index < 100 ? 'completed' : index === 100 ? 'in_progress' : 'pending',
+      activeForm: `Doing step ${index + 1}`,
+    }))
+    await $.tool.call({ tool: 'mcp__mystique__tasks', todos: many } as never)
+    await drain($.turn.step({ ...step, agentId: 'agent-1' }))
+    await $.tool.call({ tool: 'mcp__mystique__tasks', todos: many, agentId: 'agent-1' } as never)
+    await $.command.run(typed('progress', ''))
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const texts = (await ui.findAll({ type: 'Text' })).map(text => text.text)
+
+    expect(texts.reduce((sum, text) => sum + text.length, 0)).toBeLessThan(30_000)
+    expect(texts).toContain('Doing step 101')
+    expect(texts).toContain('  … 99 done before')
+    expect(texts.some(text => /^  … \d+ more to do$/.test(text))).toBe(true)
     await ui.unmount()
   })
 })

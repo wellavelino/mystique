@@ -1,6 +1,6 @@
 {
   "name": "mystique",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A highlighter pen for Claude's replies, and a side panel for query results as tables and for the goal, the tasks and every subagent.",
   "author": {
     "name": "wellavelino",
@@ -89,6 +89,16 @@
       "options": [
         "auto",
         "manual"
+      ],
+      "default": "auto"
+    },
+    "tasks": {
+      "type": "string",
+      "title": "Task list tool",
+      "description": "Where the session's model has no task list tool of Claude Code's own, the mod gives it one, so the panel and the band have tasks to show. auto: offer it then. off: never (the task list then shows only what Claude Code's own tools keep).",
+      "options": [
+        "auto",
+        "off"
       ],
       "default": "auto"
     }

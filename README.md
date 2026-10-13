@@ -57,7 +57,7 @@ It opens beside the transcript (docked in the fullscreen layout, above the promp
 | --- | --- |
 | `/tables` | Opens the panel on the tables captured so far. |
 | `/tables clear` | Forgets them. |
-| `/progress` | Opens the panel on the goal, the tasks and the subagents. |
+| `/progress` | Opens the panel on the goal, every task and every subagent, and answers with the same list in words. It reads Claude Code's own task list first, where the session has one. |
 | `/progress clear` | Forgets the tasks and the subagents on the board. The goal and the figures stay. |
 
 Click in it, or give it the keyboard with `ctrl+x tab`: `t` and `g` switch between Tables and Agents, `Esc` hands the keyboard back. Close it with its close mark or `ctrl+x x`; once you close it by hand it stays closed until you ask for it again.
@@ -100,9 +100,13 @@ Output without any frame (CSV, tab-separated, `-A`, sqlite's list mode) is read 
 
 | Card | What it shows |
 | --- | --- |
-| Goal | What you gave Claude Code's own `/goal`; without one, the prompt being worked on. Under it the task list Claude keeps (its todo and task tools): a bar of done over total, and the tasks around the one in progress. |
+| Goal | What you gave Claude Code's own `/goal`; without one, the prompt being worked on. Under it the task list Claude keeps (its todo and task tools): a bar of done over total, then every task with a bar of its own (of a list longer than 60, the stretch around the task in progress). A task has no percent, so a done one is a full bar, a waiting one an empty bar, and the one in progress a bar that moves. |
 | Main thread | How full its context window is, its share of what the session spent, and your rate-limit windows (`5h`, `7d`). |
-| one per subagent | Its name and type, whether it runs and for how long, its tool calls and the one running now, its context, its share of the session's use, and its own task bar when it keeps a list. Finished agents leave with your next prompt; what they spent stays in the session's total. |
+| one per subagent | Its name and type, whether it runs and for how long, its tool calls and the one running now, its context, its share of the session's use, and its own tasks, each with its bar, when it keeps a list. Its mark turns while it runs. Finished agents leave with your next prompt; what they spent stays in the session's total. |
+
+What moves is redrawn four times a second, and only while the Agents tab is on screen and something is in progress. Claude keeps a task list for work with several steps: with none, the Goal card says so.
+
+**Where the tasks come from.** Claude Code's own task tools (`TodoWrite`, or `TaskCreate` and `TaskUpdate`) where the session's model has them. Where it has none, the mod gives the model one of its own, `mcp__mystique__tasks`, which only keeps the list for the panel and the band: about 150 tokens of tool description in the prompt, and one short tool call each time a step starts or ends. It needs no permission prompt. Set **Task list tool** to `off` in `/config` to leave it out.
 
 The band above the prompt shows the same in one line per thread; it appears once there is a goal, a task list or a subagent, and can be turned off.
 
@@ -119,6 +123,7 @@ The band above the prompt shows the same in one line per thread; it appears once
 | Table capture | `databases`, `everything` (any table-shaped tool output), `off` | `databases` |
 | Progress band | `on`, `off` | `on` |
 | Panel | `auto` (opens for a query result or a new subagent), `manual` (opens on `/tables` or `/progress` only) | `auto` |
+| Task list tool | `auto` (the model gets the mod's task tool where Claude Code gives it none), `off` | `auto` |
 
 ## Good to know
 
