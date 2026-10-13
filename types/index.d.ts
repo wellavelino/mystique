@@ -35,6 +35,13 @@ export type Task = {
   active?: string
 }
 
+/** One tool call a thread made, as its card lists it: the tool, and what it was called on. */
+export type Call = {
+  tool: string
+  note: string
+  isFailed: boolean
+}
+
 /** One subagent as the progress band follows it. */
 export type AgentRow = {
   id: string
@@ -49,6 +56,10 @@ export type AgentRow = {
   /** What it has spent so far, in input-token equivalents. */
   used: number
   tasks: Task[]
+  /** Its last tool calls, the newest last, and the end of what it last thought, or said (`isSaid`). */
+  recent: Call[]
+  thought: string
+  isSaid?: boolean
   /** When it was first heard of and when it ended, in milliseconds of the session's clock. */
   startedAt: number
   endedAt?: number
@@ -61,6 +72,9 @@ export type Board = {
   /** The prompt the turn in progress answers. */
   ask: string
   tasks: Task[]
+  /** The main thread's last tool calls, the newest last, and the end of what it last thought. */
+  recent: Call[]
+  thought: string
   agents: AgentRow[]
   context: number
   window: number

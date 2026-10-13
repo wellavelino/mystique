@@ -1,6 +1,6 @@
 {
   "name": "mystique",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A highlighter pen for Claude's replies, and a side panel for query results as tables and for the goal, the tasks and every subagent.",
   "author": {
     "name": "wellavelino",

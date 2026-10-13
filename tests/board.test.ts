@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { aimed, asked, bar, cleared, compact, elapsed, EMPTY, ended, filled, hasWork, isAsk, isLive, named, nearby, progress, pulse, reconciled, share, spent, spinner, stepped, summary, sweep, tasked, tooled } from '../hooks/lib/board'
+import { aimed, asked, bar, cleared, compact, elapsed, EMPTY, ended, filled, hasWork, isAsk, isLive, named, nearby, noted, progress, pulse, reconciled, share, spent, spinner, stepped, summary, sweep, tasked, thought, tooled } from '../hooks/lib/board'
 
 const USAGE = { input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 40_000, cache_creation_input_tokens: 800 }
 
@@ -57,6 +57,7 @@ describe('the board', () => {
     expect(hasWork(board)).toBe(true)
     expect(asked(board, '/tables')).toEqual(board)
     expect(asked(board, '<agent-message from="a1">done</agent-message>')).toEqual(board)
+    expect(asked(board, 'Pass this message of mine on to the subagent "a" (agent id a1) with SendMessage: stop')).toEqual(board)
     expect(aimed(board, '').goal).toBe('all tests pass on main')
     expect(aimed(board, 'clear').goal).toBe(null)
   })
@@ -69,7 +70,11 @@ describe('the board', () => {
 
     expect(board.context).toBe(42_000)
     expect(board.agents).toEqual([
-      { id: 'agent-1', label: '', type: '', status: 'running', tools: 2, last: 'db query', context: 12_000, used: 4000, tasks: [], startedAt: 5000, endedAt: undefined },
+      {
+        id: 'agent-1', label: '', type: '', status: 'running', tools: 2, last: 'db query', context: 12_000, used: 4000, tasks: [], startedAt: 5000, endedAt: undefined,
+        recent: [{ tool: 'Grep', note: 'x', isFailed: false }, { tool: 'db query', note: '', isFailed: false }],
+        thought: '',
+      },
     ])
     expect(share(board, board.used)).toBe(64)
     expect(share(board, board.agents[0]?.used ?? 0)).toBe(36)
@@ -352,5 +357,82 @@ describe('summary', () => {
     const board = tooled(asked(EMPTY, 'Fix the login test'), undefined, 'TodoWrite', { todos: [{ content: 'a', status: 'completed', activeForm: 'A' }] }, {}, 0)
 
     expect(summary(board)).toBe('Panel opened: 1 of 1 tasks done · 0 subagents on the board.\n◆ Working on: Fix the login test\n  ✔ a')
+  })
+})
+
+describe('what a thread is doing', () => {
+  test('says what a call was made on: the command, the file, the pattern', () => {
+    expect(noted({ command: 'npm test -- --watch\necho done' })).toBe('npm test -- --watch')
+    expect(noted({ file_path: '/home/me/code/parser/src/index.ts' })).toBe('/home/me/code/parser/src/index.ts')
+    expect(noted({ pattern: 'TODO', path: 'src' })).toBe('TODO')
+    expect(noted({ description: 'Review the parser', prompt: 'Read everything' })).toBe('Review the parser')
+    expect(noted({ todos: [] })).toBe('')
+    expect(noted(undefined)).toBe('')
+  })
+
+  test('keeps a long command’s start and a long path’s end', () => {
+    const command = noted({ command: `psql -c "${'x'.repeat(200)}"` })
+    const path = noted({ file_path: `/${'deep/'.repeat(40)}parser.ts` })
+
+    expect(command.length).toBe(60)
+    expect(command).toMatch(/^psql -c "x+…$/)
+    expect(path.length).toBe(60)
+    expect(path).toMatch(/^….*\/parser\.ts$/)
+  })
+
+  test('keeps the last calls of an agent and of the main thread, a failed one marked', () => {
+    let board = tooled(EMPTY, undefined, 'Bash', { command: 'git status' }, {}, 0)
+    board = tooled(board, undefined, 'Read', { file_path: '/tmp/a.ts' }, undefined, 0, true)
+    board = tooled(board, 'agent-1', 'Bash', { command: 'ls' }, {}, 0)
+
+    expect(board.recent).toEqual([
+      { tool: 'Bash', note: 'git status', isFailed: false },
+      { tool: 'Read', note: '/tmp/a.ts', isFailed: true },
+    ])
+    expect(board.agents[0]?.recent).toEqual([{ tool: 'Bash', note: 'ls', isFailed: false }])
+
+    for (let index = 0; index < 8; index += 1) {
+      board = tooled(board, 'agent-1', 'Bash', { command: `echo ${index}` }, {}, 0)
+    }
+
+    expect(board.agents[0]?.recent.map(call => call.note)).toEqual(['echo 3', 'echo 4', 'echo 5', 'echo 6', 'echo 7'])
+    expect(board.agents[0]?.tools).toBe(9)
+  })
+
+  test('leaves a failed task call’s list as it was, and never lists the mod’s own task tool', () => {
+    const todos = [{ content: 'a', status: 'pending', activeForm: 'A' }]
+    let board = tooled(EMPTY, undefined, 'TodoWrite', { todos }, {}, 0)
+    board = tooled(board, undefined, 'TodoWrite', { todos: [] }, undefined, 0, true)
+    board = tooled(board, undefined, 'mcp__mystique__tasks', { todos }, {}, 0)
+
+    expect(board.tasks.length).toBe(1)
+    expect(board.recent).toEqual([
+      { tool: 'TodoWrite', note: '', isFailed: false },
+      { tool: 'TodoWrite', note: '', isFailed: true },
+    ])
+  })
+
+  test('keeps the end of what a thread last thought, on one line', () => {
+    let board = thought(EMPTY, undefined, 'First I read the file.\n\nThe parser fails on\nnested   lists.\n', 0)
+    expect(board.thought).toBe('The parser fails on nested lists.')
+
+    // A step that thought nothing leaves what was thought before.
+    expect(thought(board, undefined, '  \n', 0).thought).toBe('The parser fails on nested lists.')
+
+    board = thought(board, 'agent-1', `${'word '.repeat(100)}the end.`, 7000)
+    expect(board.agents[0]).toMatchObject({ id: 'agent-1', startedAt: 7000 })
+    expect(board.agents[0]?.thought.length).toBe(200)
+    expect(board.agents[0]?.thought).toMatch(/^….* the end\.$/)
+    expect(board.agents[0]?.isSaid).toBe(false)
+    expect(thought(board, 'agent-1', 'The sum is 10.', 8000, true).agents[0]).toMatchObject({ thought: 'The sum is 10.', isSaid: true })
+  })
+
+  test('is no work for the band to show, and is forgotten on a clear', () => {
+    let board = tooled(EMPTY, undefined, 'Bash', { command: 'ls' }, {}, 0)
+    board = thought(board, undefined, 'Listing the files.', 0)
+
+    expect(hasWork(board)).toBe(false)
+    expect(isLive(board)).toBe(false)
+    expect(cleared(board)).toMatchObject({ recent: [], thought: '' })
   })
 })

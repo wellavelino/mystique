@@ -56,9 +56,9 @@ It opens beside the transcript (docked in the fullscreen layout, above the promp
 | Command | What it does |
 | --- | --- |
 | `/tables` | Opens the panel on the tables captured so far. |
-| `/tables clear` | Forgets them. |
+| `/tables clear` | Forgets them. The `clear` button in the panel does the same. |
 | `/progress` | Opens the panel on the goal, every task and every subagent, and answers with the same list in words. It reads Claude Code's own task list first, where the session has one. |
-| `/progress clear` | Forgets the tasks and the subagents on the board. The goal and the figures stay. |
+| `/progress clear` | Forgets the tasks and the subagents on the board, and the main thread's last calls and thought. The goal and the figures stay. |
 
 Click in it, or give it the keyboard with `ctrl+x tab`: `t` and `g` switch between Tables and Agents, `Esc` hands the keyboard back. Close it with its close mark or `ctrl+x x`; once you close it by hand it stays closed until you ask for it again.
 
@@ -80,6 +80,7 @@ Run a query the way you always do, or let Claude run it:
 | a row's number | | Opens the row as a record: every column, values unwrapped. `b` goes back, `p` / `n` step through rows. |
 | `◀` `▶` | `h` `l` | Slides the columns when the panel is too narrow for all of them. |
 | `‹` `›` | `p` `n` | Walks between the captured tables (the last 10 are kept). |
+| `clear` | `c` | Forgets every captured table, as `/tables clear` does. It asks nothing first, and there is no way back. |
 
 What is read as a table:
 
@@ -101,10 +102,16 @@ Output without any frame (CSV, tab-separated, `-A`, sqlite's list mode) is read 
 | Card | What it shows |
 | --- | --- |
 | Goal | What you gave Claude Code's own `/goal`; without one, the prompt being worked on. Under it the task list Claude keeps (its todo and task tools): a bar of done over total, then every task with a bar of its own (of a list longer than 60, the stretch around the task in progress). A task has no percent, so a done one is a full bar, a waiting one an empty bar, and the one in progress a bar that moves. |
-| Main thread | How full its context window is, its share of what the session spent, and your rate-limit windows (`5h`, `7d`). |
-| one per subagent | Its name and type, whether it runs and for how long, its tool calls and the one running now, its context, its share of the session's use, and its own tasks, each with its bar, when it keeps a list. Its mark turns while it runs. Finished agents leave with your next prompt; what they spent stays in the session's total. |
+| Main thread | How full its context window is, its share of what the session spent, and your rate-limit windows (`5h`, `7d`). Then its last five tool calls, the end of what it last thought, and a field to tell it what to do next. |
+| one per subagent | Its name and type, whether it runs and for how long, its tool calls and the one running now, its context, its share of the session's use, and its own tasks, each with its bar, when it keeps a list. Then its last five tool calls, each with what it was made on (the command, the file, the pattern; a failed one marked `✖`), the end of what it last thought, and, while it runs, a field to send it a message. Its mark turns while it runs. Finished agents leave with your next prompt; what they spent stays in the session's total. |
 
 What moves is redrawn four times a second, and only while the Agents tab is on screen and something is in progress. Claude keeps a task list for work with several steps: with none, the Goal card says so.
+
+**Steering from a card.** Click a card's field (or reach it with the keyboard once the panel has it), type, and press Enter. On a subagent's card the line goes to that subagent's inbox, and it reads it at its next model request: "stop after this file" stops it there, not in the middle of the call it is making. On the Main thread card it is submitted as a prompt of your own, which runs once the turn in progress ends. A toast says it was sent; when it was not, a line in the transcript says why. In auto mode Claude Code refuses a mod's own message to a subagent (its classifier judges only what a model request asked for), so the mod asks the main thread to pass your line on with its own `SendMessage` instead, which costs one short turn. That needs the main thread to be idle (the agent running in the background): while its turn is in progress nobody can pass the line on, and the transcript says so. While a field has the keyboard the panel's letter keys are typed into it; `Esc` hands them back. Nothing here interrupts a model request that is already under way.
+
+**What "thinking" shows.** The last paragraph of the thread's thinking at its latest model request, as it streamed. A subagent that thought nothing shows what it last said instead, labelled `said` (its own words are drawn nowhere else); the main thread's reply is left to the transcript. The row is there only when Claude Code hands the thinking out as text: where the model's thinking is kept back (the transcript then holds an empty thinking block, as with the current models by default), with thinking off, or for an agent that runs elsewhere (a remote one), there is none to show.
+
+**The main thread is not told what you sent.** A message that reaches a subagent directly is between you and that agent: if its report mentions being told to change course, Claude may say it sent no such message.
 
 **Where the tasks come from.** Claude Code's own task tools (`TodoWrite`, or `TaskCreate` and `TaskUpdate`) where the session's model has them. Where it has none, the mod gives the model one of its own, `mcp__mystique__tasks`, which only keeps the list for the panel and the band: about 150 tokens of tool description in the prompt, and one short tool call each time a step starts or ends. It needs no permission prompt. Set **Task list tool** to `off` in `/config` to leave it out.
 
