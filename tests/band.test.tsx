@@ -33,7 +33,27 @@ const typed = (command: string, args: string) =>
     presentation: { isFullscreen: true, columns: 160 },
   }) as const
 
-type Said = { logs: string[]; opened: string[]; asks: { model?: string; prompt: string }[]; calls: string[]; tools: string[]; registered: { name: string; isDeferred?: boolean }[] }
+type Said = {
+  logs: string[]
+  opened: string[]
+  asks: { model?: string; prompt: string }[]
+  calls: string[]
+  tools: string[]
+  registered: { name: string; isDeferred?: boolean }[]
+  /** What the model thinks, in the pieces it streams, and what it says, at every request. */
+  thinking: string[]
+  answers: string[]
+  /** The tools that fail when called. */
+  failing: string[]
+  /** What was sent to an agent, what was submitted as a prompt, and why a send is refused when it is. */
+  sent: { to: string; text: string }[]
+  prompts: { text: string; origin: unknown }[]
+  refusals: string[]
+  /** Why a prompt is dropped, and what a send breaks with, when they are. */
+  drops: string[]
+  failures: string[]
+  toasts: string[]
+}
 
 /** The engine beneath the mod: turns, model requests that report `usage`, agents, and a model to ask. */
 function world(
@@ -41,15 +61,35 @@ function world(
   reply = '{"highlights": [], "missed": ""}',
   surfaces: readonly ('terminal' | 'desktop')[] = ['terminal'],
 ): Said & { clock: ReturnType<typeof mock.clock> } {
-  const said: Said = { logs: [], opened: [], asks: [], calls: [], tools: [], registered: [] }
+  const said: Said = {
+    logs: [],
+    opened: [],
+    asks: [],
+    calls: [],
+    tools: [],
+    registered: [],
+    thinking: [],
+    answers: [],
+    failing: [],
+    sent: [],
+    prompts: [],
+    refusals: [],
+    drops: [],
+    failures: [],
+    toasts: [],
+  }
   const clock = mock.clock(on, { now: 1000 })
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('turn.step', async function* ($, e) {
+    for (const text of said.thinking) {
+      yield { kind: 'thinking', index: 0, text } as const
+    }
+
     return {
       turnId: e.turnId,
       index: e.index,
-      answer: '',
+      answer: said.answers.join(''),
       toolUses: [],
       stopReason: 'end_turn',
       usage: usage(e.agentId === undefined ? 40_000 : 10_000),
@@ -57,6 +97,10 @@ function world(
   })
   on('tool.call', ($, e) => {
     said.calls.push(String(e.tool))
+
+    if (said.failing.includes(String(e.tool))) {
+      return { result: 'boom', text: 'boom', isError: true }
+    }
 
     if (e.tool === 'TaskList') {
       return {
@@ -109,6 +153,29 @@ function world(
     return { value: { isPlaced: true } }
   })
   on('ui.panes', () => ({ value: [] }))
+  on('ui.toast', ($, e) => {
+    said.toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  on('session.send', ($, e) => {
+    if (said.failures[0] !== undefined) {
+      throw new Error(said.failures[0])
+    }
+
+    said.sent.push({ to: JSON.stringify(e.to), text: e.text })
+
+    return said.refusals[0] === undefined ? { isDelivered: true } : { isDelivered: false, reason: said.refusals[0] }
+  })
+  on('prompt.submit', ($, e) => {
+    if (said.drops[0] !== undefined) {
+      return { drop: said.drops[0] }
+    }
+
+    said.prompts.push({ text: e.text, origin: e.origin })
+
+    return { text: e.text }
+  })
   on('ui.log', ($, e) => {
     said.logs.push(e.text)
 
@@ -353,6 +420,273 @@ describe('the agents board', () => {
 
     const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
     expect((await ui.find({ type: 'Text' }))?.text).toBe('engine band')
+    await ui.unmount()
+  })
+})
+
+describe('what a thread is doing, on its card', () => {
+  test('lists a thread’s last tool calls and the end of what it thought', async ($, on) => {
+    const said = world(on)
+    said.thinking.push('First the tests.\n\n', 'The parser fails on ', 'nested lists.')
+    await $.turn.start({ text: 'Review the parser', turnId: 'turn-1' })
+    await drain($.turn.step(step))
+    await drain($.turn.step({ ...step, agentId: 'agent-1' }))
+    await $.tool.call(AGENT_CALL)
+    await $.tool.call({ tool: 'Read', file_path: '/src/parser.ts', agentId: 'agent-1' } as never)
+    await $.tool.call({ tool: 'Bash', command: 'git status' })
+
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...PANE, surface })
+      const texts = (await ui.findAll({ type: 'Text' })).map(text => text.text)
+
+      expect(texts).toContain('Bash ls')
+      expect(texts).toContain('Read /src/parser.ts')
+      expect(texts).toContain('Bash git status')
+      // The main thread's and the agent's.
+      expect(texts.filter(text => text === 'The parser fails on nested lists.').length).toBe(2)
+      expect(texts).not.toContain('✖')
+      await ui.unmount()
+    }
+  })
+
+  test('passes the model’s response on as it streamed', async ($, on) => {
+    const said = world(on)
+    said.thinking.push('One. ', 'Two.')
+    said.answers.push('Done.')
+    const stream = $.turn.step(step)
+    const chunks: unknown[] = []
+    let read = await stream.next()
+
+    while (read.done !== true) {
+      chunks.push(read.value)
+      read = await stream.next()
+    }
+
+    expect(chunks).toEqual([
+      { kind: 'thinking', index: 0, text: 'One. ' },
+      { kind: 'thinking', index: 0, text: 'Two.' },
+    ])
+    expect(read.value).toMatchObject({ answer: 'Done.', stopReason: 'end_turn' })
+  })
+
+  test('marks a call that failed', async ($, on) => {
+    const said = world(on)
+    said.failing.push('Read')
+    await drain($.turn.step({ ...step, agentId: 'agent-1' }))
+    await $.tool.call({ tool: 'Read', file_path: '/src/parser.ts', agentId: 'agent-1' } as never)
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const texts = (await ui.findAll({ type: 'Text' })).map(text => text.text)
+
+    expect(texts).toContain('Read /src/parser.ts')
+    expect(texts).toContain('✖')
+    await ui.unmount()
+  })
+
+  test('shows what a subagent said where it thought nothing, and leaves the main thread’s reply to the transcript', async ($, on) => {
+    const said = world(on)
+    said.answers.push('I will read the parser first.')
+    await drain($.turn.step(step))
+    await drain($.turn.step({ ...step, agentId: 'agent-1' }))
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const texts = (await ui.findAll({ type: 'Text' })).map(text => text.text)
+
+    expect(texts.filter(text => text === 'I will read the parser first.').length).toBe(1)
+    expect(texts).toContain('said')
+    expect(texts).not.toContain('thinking')
+    await ui.unmount()
+  })
+
+  test('labels what a subagent thought as thinking, and what it only said as said', async ($, on) => {
+    const said = world(on)
+    said.thinking.push('The parser fails on nested lists.')
+    await drain($.turn.step({ ...step, agentId: 'agent-1' }))
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const texts = async () => (await ui.findAll({ type: 'Text' })).map(text => text.text)
+
+    expect(await texts()).toContain('thinking')
+    expect(await texts()).not.toContain('said')
+
+    said.thinking.length = 0
+    said.answers.push('The sum is 10.')
+    await drain($.turn.step({ ...step, agentId: 'agent-1' }))
+
+    expect(await texts()).toContain('said')
+    expect(await texts()).toContain('The sum is 10.')
+    expect(await texts()).not.toContain('thinking')
+    await ui.unmount()
+  })
+
+  test('lists no call of the mod’s own task tool, and keeps the band away for calls alone', async ($, on) => {
+    const said = world(on)
+    said.thinking.push('Listing the files.')
+    await $.turn.start({ text: 'What is in here?', turnId: 'turn-1' })
+    await drain($.turn.step(step))
+    await $.tool.call({ tool: 'Bash', command: 'ls' })
+
+    const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect((await band.find({ type: 'Text' }))?.text).toBe('engine band')
+    await band.unmount()
+
+    await $.tool.call({ tool: 'mcp__mystique__tasks', todos: TODOS } as never)
+    await $.command.run(typed('progress', ''))
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    const texts = (await ui.findAll({ type: 'Text' })).map(text => text.text)
+
+    expect(texts).toContain('Bash ls')
+    expect(texts.some(text => /mystique tasks/.test(text))).toBe(false)
+    await ui.unmount()
+  })
+})
+
+describe('steering a thread from its card', () => {
+  test('sends what is typed on a subagent’s card to that subagent', async ($, on) => {
+    const said = world(on)
+    await drain($.turn.step({ ...step, agentId: 'agent-1' }))
+
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...PANE, surface })
+
+      expect((await ui.find({ key: 'steer-agent-1' }))?.props).toMatchObject({ submitLabel: 'send' })
+      await ui.input({ key: 'steer-agent-1', text: '  stop after this file ' })
+      await ui.unmount()
+    }
+
+    expect(said.sent.map(one => one.text)).toEqual(['stop after this file', 'stop after this file'])
+    expect(said.sent[0]?.to).toMatch(/agent-1/)
+    expect(said.toasts).toEqual([
+      'Sent to Review the parser: it reads it at its next step.',
+      'Sent to Review the parser: it reads it at its next step.',
+    ])
+    expect(said.prompts).toEqual([])
+  })
+
+  test('submits what is typed on the main thread’s card as the person’s next prompt', async ($, on) => {
+    const said = world(on)
+    await $.command.run(typed('progress', ''))
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    await ui.input({ key: 'steer-main', text: 'use the test database' })
+    await ui.unmount()
+
+    expect(said.prompts.map(one => one.text)).toEqual(['use the test database'])
+    expect(said.prompts[0]?.origin).toMatchObject({ kind: 'plugin', asUser: true })
+    expect(said.toasts).toEqual(['Sent to the main thread: it reads it once the turn in progress ends.'])
+    expect(said.sent).toEqual([])
+  })
+
+  test('asks the main thread to pass a message on when the engine refuses the mod’s own', async ($, on) => {
+    const said = world(on)
+    said.refusals.push('auto mode could not evaluate it')
+    await drain($.turn.step({ ...step, agentId: 'agent-1' }))
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    await ui.input({ key: 'steer-agent-1', text: 'stop after this file' })
+    await ui.unmount()
+
+    expect(said.sent.length).toBe(1)
+    expect(said.prompts.map(one => one.text)).toEqual([
+      'Pass this message of mine on to the subagent "Review the parser" (agent id agent-1) with SendMessage, word for word, then carry on as you were. I typed it on that agent\'s card in the mystique panel.\n\nstop after this file',
+    ])
+    expect(said.toasts).toEqual(['No direct line to Review the parser: Claude was asked to pass it on.'])
+    expect(said.logs).toEqual([])
+
+    // The turn that passes it on is no new piece of work: the board keeps naming the one in hand.
+    await $.turn.start({ text: 'Review the parser', turnId: 'turn-1' })
+    await $.turn.start({ text: said.prompts[0]?.text ?? '', turnId: 'turn-2' })
+    expect((await $.command.run(typed('progress', ''))).text).toMatch(/◆ Working on: Review the parser\n/)
+  })
+
+  test('asks nobody to pass a message on while the main thread’s turn is in progress', async ($, on) => {
+    const said = world(on)
+    said.refusals.push('auto mode could not evaluate it.')
+    await $.turn.start({ text: 'Review the parser', turnId: 'turn-1' })
+    await drain($.turn.step({ ...step, agentId: 'agent-1' }))
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    await ui.input({ key: 'steer-agent-1', text: 'stop after this file' })
+
+    expect(said.prompts).toEqual([])
+    expect(said.toasts).toEqual([])
+    expect(said.logs).toEqual([
+      'Not sent to Review the parser: auto mode could not evaluate it. Claude cannot pass it on either before its turn in progress ends: send it again then.',
+    ])
+
+    // The turn over, the agent still running in the background: now there is someone to ask.
+    await $.turn.complete({ answer: 'Started.', durationMs: 5, isAborted: false, turnId: 'turn-1', reason: 'answer' })
+    await ui.input({ key: 'steer-agent-1', text: 'stop after this file' })
+    expect(said.prompts.length).toBe(1)
+    await ui.unmount()
+  })
+
+  test('says why when a prompt is dropped or a send breaks', async ($, on) => {
+    const said = world(on)
+    said.drops.push('a hook said no')
+    said.refusals.push('auto mode could not evaluate it.')
+    await drain($.turn.step({ ...step, agentId: 'agent-1' }))
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    await ui.input({ key: 'steer-main', text: 'use the test database' })
+    await ui.input({ key: 'steer-agent-1', text: 'stop' })
+    said.failures.push('the socket closed')
+    await ui.input({ key: 'steer-agent-1', text: 'stop' })
+    await ui.unmount()
+
+    expect(said.logs.slice(0, 2)).toEqual([
+      'Not sent to the main thread: a hook said no',
+      'Not sent to Review the parser: a hook said no',
+    ])
+    // A send that throws is caught: the engine beneath says in its own words what broke.
+    expect(said.logs.length).toBe(3)
+    expect(said.logs[2]).toMatch(/^Not sent to Review the parser: \S/)
+    expect(said.toasts).toEqual([])
+  })
+
+  test('says why, in the transcript, when a message cannot be delivered at all', async ($, on) => {
+    const said = world(on)
+    said.refusals.push('the agent is gone')
+    // An agent the engine's list does not hold: nobody is left to pass a message on to.
+    await drain($.turn.step({ ...step, agentId: 'agent-lost' }))
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    await ui.input({ key: 'steer-agent-lost', text: 'stop' })
+    await ui.unmount()
+
+    expect(said.logs).toEqual(['Not sent to agent: the agent is gone'])
+    expect(said.toasts).toEqual([])
+    expect(said.prompts).toEqual([])
+  })
+
+  test('draws the cards without a field where the surface has none', async ($, on) => {
+    world(on)
+    await drain($.turn.step({ ...step, agentId: 'agent-1' }))
+    await $.tool.call(AGENT_CALL)
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'mobile' })
+    const texts = (await ui.findAll({ type: 'Text' })).map(text => text.text)
+
+    expect(texts).toContain('Main thread')
+    expect(texts).toContain('Bash ls')
+    expect(await ui.find({ key: 'steer-main' })).toBeUndefined()
+    expect(await ui.find({ key: 'steer-agent-1' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('sends nothing for an empty line, and gives a finished agent no field', async ($, on) => {
+    const said = world(on)
+    await drain($.turn.step({ ...step, agentId: 'agent-1' }))
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    await ui.input({ key: 'steer-agent-1', text: '   ' })
+    expect(said.sent).toEqual([])
+    expect(said.toasts).toEqual([])
+
+    await $.turn.complete({ answer: 'done', durationMs: 5, isAborted: false, turnId: 'turn-9', agentId: 'agent-1', reason: 'answer' })
+    expect(await ui.find({ key: 'steer-agent-1' })).toBeUndefined()
+    expect(await ui.find({ key: 'steer-main' })).toBeDefined()
     await ui.unmount()
   })
 })

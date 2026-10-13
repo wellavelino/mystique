@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { AgentRow, DataTable, Task, View } from '../types'
+import type { AgentRow, Call, DataTable, Task, View } from '../types'
 import {
   aimed,
   asked,
@@ -19,6 +19,7 @@ import {
   progress,
   pulse,
   reconciled,
+  RELAY,
   share,
   spinner,
   stepped,
@@ -26,6 +27,7 @@ import {
   sweep,
   tasked,
   TASKS_TOOL,
+  thought,
   tooled,
 } from './lib/board'
 import type { Usage } from './lib/board'
@@ -57,7 +59,8 @@ const START: View = { tab: 'tables', tableId: null, shown: PAGE, column: 0, row:
 const MAX_READINGS = 40
 const MIN_REVIEWED_REPLY = 200
 const MAX_AGENT_ROWS = 6
-const TASK_TOOLS = new Set(['TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList'])
+// What of a model request's thinking is held while it streams: a card shows only its end.
+const MAX_HEARD = 4000
 // What moves in the panel moves four times a second, and each task's own bar is this wide.
 const TICK = 250
 const TASK_BAR = 10
@@ -256,6 +259,92 @@ async function track(
   }
 }
 
+/** Forgets the captured tables, rows and all; the panel stays on the tab it shows. */
+async function forget($: EngineInterface): Promise<void> {
+  const list = await read($, tables)
+  await update($, tables, () => [])
+  await update($, view, held => ({ ...START, tab: held.tab }))
+
+  for (const table of list) {
+    await $.state.set({ ...ROWS, id: table.id }, [])
+  }
+}
+
+// What the main thread is asked when the engine refuses the mod's own message to a subagent.
+const relayed = (label: string, agentId: string, text: string) =>
+  `${RELAY} "${label}" (agent id ${agentId}) with SendMessage, word for word, then carry on as you were. I typed it on that agent's card in the mystique panel.\n\n${text}`
+
+/**
+ * Sends what the person typed on a card to its thread: a message to a subagent's inbox, which it
+ * reads at its next model request, or for the main thread (`agentId` undefined) a prompt of the
+ * person's own, which runs once the turn in progress ends.
+ *
+ * The engine judges a mod's message as it judges the model's SendMessage, and refuses it where
+ * nobody is there to judge (auto mode asks its classifier, which answers only for what a model
+ * request asked for). The main thread is then asked to pass the message on: its own send is
+ * judged the usual way. Not while its turn is in progress (`isMidTurn`), though: the prompt would
+ * wait for the turn's end, and an agent the turn is waiting on would be over by then. A send that
+ * fails says why in the transcript, where the whole reason can be read: a toast holds three short
+ * lines.
+ */
+async function steer(
+  $: EngineInterface,
+  agentId: string | undefined,
+  label: string,
+  typed: string,
+  isMidTurn: boolean,
+): Promise<void> {
+  const text = typed.trim()
+
+  if (text === '') {
+    return
+  }
+
+  try {
+    if (agentId === undefined) {
+      const entered = await $.prompt.submit({ text, asUser: true })
+
+      if (entered.drop === undefined) {
+        $.ui.toast('Sent to the main thread: it reads it once the turn in progress ends.')
+      } else {
+        $.ui.log(`Not sent to the main thread: ${entered.drop}`)
+      }
+
+      return
+    }
+
+    const sent = await $.session.send({ to: { agentId }, text })
+
+    if (sent.isDelivered) {
+      $.ui.toast(`Sent to ${label}: it reads it at its next step.`)
+
+      return
+    }
+
+    const isRunning = (await $.agent.list()).some(
+      agent => agent.id === agentId && agent.status !== 'completed' && agent.status !== 'failed' && agent.status !== 'killed',
+    )
+
+    if (isRunning && isMidTurn) {
+      $.ui.log(
+        `Not sent to ${label}: ${sent.reason} Claude cannot pass it on either before its turn in progress ends: send it again then.`,
+      )
+
+      return
+    }
+
+    const entered = isRunning ? await $.prompt.submit({ text: relayed(label, agentId, text), asUser: true }) : null
+
+    if (entered !== null && entered.drop === undefined) {
+      $.ui.toast(`No direct line to ${label}: Claude was asked to pass it on.`)
+    } else {
+      $.ui.log(`Not sent to ${label}: ${entered?.drop ?? sent.reason}`)
+    }
+  } catch (error) {
+    $.ui.log(`Not sent to ${label}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
 /** Ends the rows of the agents the engine no longer runs: one whose end the mod never heard of. */
 async function settle($: EngineInterface): Promise<void> {
   try {
@@ -335,6 +424,8 @@ export const register: Register = (on, options) => {
   const readerModel = String(options.readerModel ?? 'haiku') || 'haiku'
   // The tool calls since the person last asked, for a reader that cannot see them.
   let digest = NO_CALLS
+  // The main thread's turn in progress, by its id; null while the session is idle.
+  let turning: string | null = null
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -521,6 +612,10 @@ export const register: Register = (on, options) => {
     const done = await next(e)
     const agentId = e.agentId
 
+    if (agentId === undefined || e.turnId === turning) {
+      turning = null
+    }
+
     try {
       if (agentId !== undefined) {
         const now = await $.clock.now()
@@ -545,6 +640,8 @@ export const register: Register = (on, options) => {
   // The progress band ---------------------------------------------------------------------
 
   on('turn.start', async ($, e, next) => {
+    turning = e.turnId
+
     // A turn the engine starts (an agent reporting back) carries on the same piece of work.
     if (isAsk(e.text)) {
       digest = NO_CALLS
@@ -577,11 +674,33 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.step', async function* ($, e, next) {
-    const response = yield* next(e)
+    const stream = next(e)
+    let heard = ''
+
+    // The response goes on as it streams; only its thinking is listened to, for the thread's card.
+    for await (const chunk of stream) {
+      if (chunk.kind === 'thinking') {
+        heard = `${heard}${chunk.text}`.slice(-MAX_HEARD)
+      }
+
+      yield chunk
+    }
+
+    const response = await stream.result
 
     try {
       if (response.usage !== null) {
         await track($, e.agentId, response.usage, isAuto)
+      }
+
+      // A subagent's own words are drawn nowhere else; the main thread's are the reply itself.
+      const isSaid = heard.trim() === '' && e.agentId !== undefined
+      const said = isSaid ? response.answer : heard
+
+      if (said.trim() !== '') {
+        const now = await $.clock.now()
+
+        await update($, board, held => thought(held, e.agentId, said, now, isSaid))
       }
     } catch {
       return response
@@ -737,13 +856,9 @@ export const register: Register = (on, options) => {
     try {
       digest = counted(digest, tool, agentId !== undefined, isFailed ? (ran.deny ?? ran.text ?? '') : undefined)
 
-      if (agentId !== undefined || TASK_TOOLS.has(tool)) {
-        const now = await $.clock.now()
+      const now = await $.clock.now()
 
-        await update($, board, held =>
-          tooled(held, agentId, tool, isFailed ? undefined : e, isFailed ? undefined : ran.result, now),
-        )
-      }
+      await update($, board, held => tooled(held, agentId, tool, e, isFailed ? undefined : ran.result, now, isFailed))
     } catch {
       // The board lags one call behind.
     }
@@ -831,13 +946,7 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'tables' }, async ($, e) => {
     if (e.args.trim() === 'clear') {
-      const list = await read($, tables)
-      await update($, tables, () => [])
-      await update($, view, () => START)
-
-      for (const table of list) {
-        await $.state.set({ ...ROWS, id: table.id }, [])
-      }
+      await forget($)
 
       return { text: 'The captured tables are forgotten.' }
     }
@@ -876,7 +985,10 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const elements = $.ui.resolve(e)
+    const { Box, Text, Button } = elements
+    // Not every surface draws a field: where none does, the cards have none.
+    const Input = 'Input' in elements ? elements.Input : null
     const list = await read($, tables)
     const held = await read($, view)
     const work = await read($, board)
@@ -1034,6 +1146,42 @@ export const register: Register = (on, options) => {
           near.after > 0 && <Text dimColor>{`  … ${near.after} more to do`}</Text>,
         ]
       }
+      // What a thread is doing: its last calls, each with what it was made on, and what it last thought.
+      const doing = (recent: readonly Call[] | undefined, said: string | undefined, isSaid = false) => [
+        ...(recent ?? []).map(call => (
+          <Box flexDirection="row">
+            <Box width={2} flexShrink={0}>
+              {call.isFailed ? <Text color="error">✖</Text> : <Text dimColor>·</Text>}
+            </Box>
+            <Box flexGrow={1} flexShrink={1}>
+              <Text dimColor wrap="truncate-end">
+                {call.note === '' ? call.tool : `${call.tool} ${call.note}`}
+              </Text>
+            </Box>
+          </Box>
+        )),
+        (said ?? '') !== '' && (
+          <Box flexDirection="row">
+            <Box width={9} flexShrink={0}>
+              <Text dimColor>{isSaid ? 'said' : 'thinking'}</Text>
+            </Box>
+            <Box flexGrow={1} flexShrink={1}>
+              <Text dimColor italic wrap="wrap">
+                {said}
+              </Text>
+            </Box>
+          </Box>
+        ),
+      ]
+      const field = (id: string | undefined, label: string) =>
+        Input !== null && (
+          <Input
+            key={`steer-${id ?? 'main'}`}
+            placeholder={id === undefined ? 'tell Claude what to do next…' : 'tell this agent what to do…'}
+            submitLabel="send"
+            onSubmit={typed => steer($, id, label, typed, turning !== null)}
+          />
+        )
       // The agents' lists share as many rows as the main list has to itself.
       const listing = work.agents.filter(agent => agent.tasks.length > 0).length
       const agentRows = Math.max(3, Math.floor(MAX_TASK_ROWS / Math.max(1, listing)))
@@ -1068,6 +1216,8 @@ export const register: Register = (on, options) => {
             {work.agents.length > 0 && use(work.used)}
             {limits !== '' && stat('limits', null, 'success', limits)}
             {work.context <= 0 && limits === '' && <Text dimColor>Figures arrive with the next model request.</Text>}
+            {doing(work.recent, work.thought)}
+            {field(undefined, 'the main thread')}
           </Box>
           {agents.length === 0 && (
             <Box paddingX={1} marginTop={1}>
@@ -1113,6 +1263,8 @@ export const register: Register = (on, options) => {
                 {use(agent.used)}
                 {steps(agent.tasks)}
                 {todos(agent.tasks, agentRows)}
+                {doing(agent.recent, agent.thought, agent.isSaid === true)}
+                {isRunning && field(agent.id, agent.label || 'agent')}
               </Box>
             )
           })}
@@ -1150,15 +1302,16 @@ export const register: Register = (on, options) => {
               ▦ {table.title}
             </Text>
           </Box>
-          {list.length > 1 && (
-            <Box gap={1} marginLeft={1} flexShrink={0}>
-              <Button key="prev" label="‹" hotkey="p" onPress={turn(-1)} />
+          <Box gap={1} marginLeft={1} flexShrink={0}>
+            {list.length > 1 && <Button key="prev" label="‹" hotkey="p" onPress={turn(-1)} />}
+            {list.length > 1 && (
               <Text dimColor>
                 table {at + 1} of {list.length}
               </Text>
-              <Button key="next" label="›" hotkey="n" onPress={turn(1)} />
-            </Box>
-          )}
+            )}
+            {list.length > 1 && <Button key="next" label="›" hotkey="n" onPress={turn(1)} />}
+            <Button key="clear" label="clear" hotkey="c" onPress={() => forget($)} />
+          </Box>
         </Box>
         <Text dimColor wrap="truncate-end">
           {table.source} · {table.rowCount} row{table.rowCount === 1 ? '' : 's'} × {table.columns.length}{' '}

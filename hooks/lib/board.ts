@@ -1,9 +1,11 @@
-import type { AgentRow, Board, Task } from '../../types'
+import type { AgentRow, Board, Call, Task } from '../../types'
 
 export const EMPTY: Board = {
   goal: null,
   ask: '',
   tasks: [],
+  recent: [],
+  thought: '',
   agents: [],
   context: 0,
   window: 0,
@@ -18,6 +20,9 @@ export const TASKS_TOOL = 'mcp__mystique__tasks'
 const MAX_AGENTS = 24
 const MAX_TASKS = 200
 const MAX_LABEL = 120
+const MAX_RECENT = 5
+const MAX_NOTE = 60
+const MAX_THOUGHT = 200
 
 /** What one model request reports of its cost, as the API counts it. */
 export type Usage = {
@@ -61,14 +66,18 @@ const COMMAND = /^\/[a-z][\w:-]*(\s|$)/i
 const DELIVERY =
   /^<(agent-message|task-notification|system-reminder|teammate-message|cross-session-message|local-command-[\w-]+|command-[\w-]+)[\s>]/
 
+/** How the prompt opens that asks the main thread to pass a card's message on to a subagent. */
+export const RELAY = 'Pass this message of mine on to the subagent'
+
 /**
  * Whether a turn's opening text is the person asking for something. A turn the engine starts for
- * a slash command or a delivery (an agent's message, a task's notification) is not.
+ * a slash command or a delivery (an agent's message, a task's notification) is not, nor is the
+ * mod's own request to pass a message on: the work stays what it was.
  */
 export function isAsk(text: string): boolean {
   const opening = text.trimStart()
 
-  return opening !== '' && !COMMAND.test(opening) && !DELIVERY.test(opening)
+  return opening !== '' && !COMMAND.test(opening) && !DELIVERY.test(opening) && !opening.startsWith(RELAY)
 }
 
 /** A new prompt: it names the work until a goal does, and clears what the last turn finished. */
@@ -188,6 +197,8 @@ const fresh = (id: string, now: number): AgentRow => ({
   context: 0,
   used: 0,
   tasks: [],
+  recent: [],
+  thought: '',
   startedAt: now,
 })
 
@@ -234,9 +245,9 @@ export function reconciled(board: Board, live: readonly string[], now: number): 
     : board
 }
 
-/** The board without its tasks and its agents: the goal and the figures stay. */
+/** The board without its tasks, its agents and what the main thread did: the goal and the figures stay. */
 export function cleared(board: Board): Board {
-  return { ...board, tasks: [], agents: [] }
+  return { ...board, tasks: [], recent: [], thought: '', agents: [] }
 }
 
 /** All the session spent: its count, or for a board kept before it was counted, what the rows hold. */
@@ -268,7 +279,36 @@ export function ended(board: Board, agentId: string, status: 'done' | 'failed', 
     : board
 }
 
-/** A tool call an agent or the main thread made: its tasks when it is a task tool, an agent's count. */
+// What a call is made on, by the argument that says it best: the first of these it carries.
+const NOTED = ['command', 'file_path', 'notebook_path', 'pattern', 'query', 'url', 'description', 'skill', 'subject']
+
+/** What a tool call was made on, in a few words: its command, its file, its pattern; '' when it names none. */
+export function noted(input: unknown): string {
+  const given = record(input)
+  const key = NOTED.find(name => text(given[name]).trim() !== '')
+  const line = key === undefined ? '' : (text(given[key]).trim().split('\n')[0]?.trim() ?? '')
+
+  if (line.length <= MAX_NOTE) {
+    return line
+  }
+
+  // A path says most at its end, anything else at its start.
+  return key?.endsWith('_path') === true ? `…${line.slice(1 - MAX_NOTE)}` : `${line.slice(0, MAX_NOTE - 1)}…`
+}
+
+const called = (tool: string) => tool.replace(/^mcp__/, '').replace(/__/g, ' ')
+
+// A thread's last calls with one more; a board kept before they were counted has none yet. The
+// mod's own task tool is no work to list: its handler books its calls through here too.
+const logged = (recent: readonly Call[] | undefined, tool: string, input: unknown, isFailed: boolean): Call[] =>
+  tool === TASKS_TOOL
+    ? [...(recent ?? [])]
+    : [...(recent ?? []), { tool: called(tool), note: noted(input), isFailed }].slice(-MAX_RECENT)
+
+/**
+ * A tool call an agent or the main thread made: one more of its last calls, its tasks when it is a
+ * task tool that did not fail, an agent's count.
+ */
 export function tooled(
   board: Board,
   agentId: string | undefined,
@@ -276,26 +316,60 @@ export function tooled(
   input: unknown,
   result: unknown,
   now: number,
+  isFailed = false,
 ): Board {
+  // A call that failed changed no list.
+  const given = isFailed ? undefined : input
+
   if (agentId === undefined) {
-    return { ...board, tasks: tasked(board.tasks, tool, input, result) }
+    return {
+      ...board,
+      tasks: tasked(board.tasks, tool, given, result),
+      recent: logged(board.recent, tool, input, isFailed),
+    }
   }
 
   // The task tools keep one list for the session: an agent that reads it, or updates a main task,
   // changes the main list and not its own.
-  const id = tool === 'TaskUpdate' ? text(record(input).taskId) : ''
+  const id = tool === 'TaskUpdate' ? text(record(given).taskId) : ''
   const row = board.agents.find(agent => agent.id === agentId)
   const isMain =
     tool === 'TaskList' ||
     (id !== '' && board.tasks.some(task => task.id === id) && row?.tasks.some(task => task.id === id) !== true)
-  const booked = isMain ? { ...board, tasks: tasked(board.tasks, tool, input, result) } : board
+  const booked = isMain ? { ...board, tasks: tasked(board.tasks, tool, given, result) } : board
 
   return withAgent(booked, agentId, now, agent => ({
     ...agent,
     tools: agent.tools + 1,
-    last: tool.replace(/^mcp__/, '').replace(/__/g, ' '),
-    tasks: isMain ? agent.tasks : tasked(agent.tasks, tool, input, result),
+    last: called(tool),
+    tasks: isMain ? agent.tasks : tasked(agent.tasks, tool, given, result),
+    recent: logged(agent.recent, tool, input, isFailed),
   }))
+}
+
+/**
+ * What a thread thought at its last model request, as its card shows it: the end of it, on one
+ * line. A request that thought nothing leaves what was there. `isSaid` marks an agent's own words,
+ * kept where it thought none.
+ */
+export function thought(
+  board: Board,
+  agentId: string | undefined,
+  said: string,
+  now: number,
+  isSaid = false,
+): Board {
+  const last = said.trim().split(/\n\s*\n/).at(-1)?.replace(/\s+/g, ' ').trim() ?? ''
+
+  if (last === '') {
+    return board
+  }
+
+  const kept = last.length > MAX_THOUGHT ? `…${last.slice(1 - MAX_THOUGHT)}` : last
+
+  return agentId === undefined
+    ? { ...board, thought: kept }
+    : withAgent(board, agentId, now, agent => ({ ...agent, thought: kept, isSaid }))
 }
 
 export type Progress = { done: number; total: number; current: string }

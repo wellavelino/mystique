@@ -204,6 +204,39 @@ describe('the data panel', () => {
     await ui.unmount()
   })
 
+  test('forgets the tables on a press of clear in the panel', async ($, on) => {
+    world(on, planets(2))
+    await $.tool.call({ tool: 'Bash', command: 'psql -c "select 1 from a"' })
+    await $.tool.call({ tool: 'Bash', command: 'psql -c "select 1 from b"' })
+
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ ...PANE, surface })
+
+      expect((await ui.find({ key: 'clear' }))?.props).toMatchObject({ label: 'clear', hotkey: 'c' })
+      await ui.unmount()
+    }
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    await ui.press({ key: 'clear' })
+
+    expect(await ui.find({ type: 'Text', text: 'No tables yet' })).toBeDefined()
+    expect((await ui.find({ key: 'tab-tables' }))?.props).toMatchObject({ label: 'Tables 0' })
+    // Nothing is left to clear.
+    expect(await ui.find({ key: 'clear' })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('keeps the tab the person is on when the tables are forgotten', async ($, on) => {
+    world(on, planets(2))
+    await $.tool.call({ tool: 'Bash', command: 'psql -c "select 1 from a"' })
+    await $.command.run(typed('progress', ''))
+    await $.command.run(typed('tables', 'clear'))
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect((await ui.find({ key: 'tab-agents' }))?.props).toMatchObject({ variant: 'primary' })
+    await ui.unmount()
+  })
+
   test('lists a table from Claude’s reply without taking the panel from a query', async ($, on) => {
     const { opened } = world(on, planets(2))
     const say = (uuid: string) =>
